@@ -126,3 +126,15 @@ RPM/PWM associations. Per-channel RPM response curves are visible under
 **Измерения RPM** after autocalibration, including failed mappings. A 3-pin DC
 fan that cannot change RPM in PWM mode is reported without guessing a mapping.
 Electrical PWM/DC mode is never changed automatically.
+
+
+## Recovery after an emergency
+
+An emergency sets fan output to full manual power and preserves the previous
+hardware mode in recovery.json. With normal cooling readings, clicking Apply
+or Autotest automatically restores that saved hardware state before beginning
+a new control session; the old error requiring a separate reset is gone.
+The explicit Return to BIOS action also works even if the temperature reading
+is high. Failed hardware restoration retains the snapshot for retry.
+Critical temperature/RPM checks remain active for new manual setpoints and
+calibration. Conflicting fan-controller daemons still prevent manual control.

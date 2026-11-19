@@ -63,7 +63,7 @@ function render(data) {
 function renderCalibration(job, data) {
  const running = job?.state === 'running';
  const button = $('#calibrate-all');
- const eligible = (data.channels || []).filter(ch => ch.writable && !ch.active && !ch.recoverable).length;
+ const eligible = (data.channels || []).filter(ch => ch.writable && !ch.active).length;
  const blocked = data.cooling_check && !data.cooling_check.can_start;
  button.disabled = running || !!data.conflict || eligible === 0 || blocked;
  button.textContent = running ? 'Автотест выполняется…' : 'Автотест всех вентиляторов ↗';

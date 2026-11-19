@@ -107,8 +107,9 @@ class AdditionalSafetyTests(unittest.TestCase):
         self.control.failsafe('test overheat')
         self.assertIn(cid,self.control.recovery)
         self.assertEqual(hwmon.number(self.hw/'pwm1'),255)
-        with self.assertRaises(core.SafetyError):
-            self.control.set_speed(cid,90)
+        result = self.control.set_speed(cid,90)
+        self.assertTrue(result['verified'])
+        self.assertNotIn(cid,self.control.recovery)
         self.control.firmware(cid)
         self.assertEqual(hwmon.number(self.hw/'pwm1_enable'),2)
         self.assertNotIn(cid,self.control.recovery)
@@ -358,3 +359,69 @@ class AssistedPairingTests(unittest.TestCase):
         self.assertEqual(item['status'], 'error')
         self.assertTrue(item['response_curve'])
         self.assertFalse(any(r.get('matched') for r in item['response_curve'].values()))
+
+
+class RecoveryWithoutManualUnblockTests(unittest.TestCase):
+    setUp = FakeHwmon.setUp
+
+    def test_manual_setpoint_auto_restores_saved_firmware_after_emergency(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 85)
+        self.control.failsafe('simulated transient')
+        self.assertIn(cid, self.control.recovery)
+        self.assertEqual(hwmon.number(self.hw/'pwm1'), 255)
+        result = self.control.set_speed(cid, 90)
+        self.assertTrue(result['verified'])
+        self.assertEqual(hwmon.number(self.hw/'pwm1'), 230)
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 1)
+        self.assertNotIn(cid, self.control.recovery)
+        self.assertEqual(self.control.originals[cid]['enable'], 2)
+        self.control.firmware(cid)
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 2)
+
+    def test_no_override_if_critical_temperature_still_present(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 85)
+        self.control.failsafe('hot')
+        (self.hw/'temp1_input').write_text('80000')
+        with self.assertRaises(core.TemperatureSafetyError):
+            self.control.set_speed(cid, 90)
+        self.assertIn(cid, self.control.recovery)
+        self.assertEqual(hwmon.number(self.hw/'pwm1'), 255)
+
+    def test_explicit_firmware_recovery_not_blocked_by_temperature(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 85)
+        self.control.failsafe('test')
+        (self.hw/'temp1_input').write_text('80000')
+        result = self.control.firmware(cid)
+        self.assertTrue(result['restored'])
+        self.assertNotIn(cid, self.control.recovery)
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 2)
+
+    def test_failed_firmware_restore_preserves_recovery(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 85)
+        self.control.failsafe('test')
+        saved = hwmon.restore
+        def fail_non_emergency(entry, emergency=False):
+            if not emergency:
+                return ['simulated EC failure']
+            return saved(entry, emergency=emergency)
+        with mock.patch.object(hwmon, 'restore', side_effect=fail_non_emergency):
+            with self.assertRaisesRegex(core.SafetyError, 'simulated EC failure'):
+                self.control.set_speed(cid, 90)
+        self.assertIn(cid, self.control.recovery)
+        self.assertEqual(hwmon.number(self.hw/'pwm1'), 255)
+
+    def test_auto_test_retries_recoverable_channel(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 85)
+        self.control.failsafe('test')
+        with mock.patch.object(core.threading, 'Thread') as fake_thread:
+            result = self.control.start_auto_test()
+        self.assertEqual(result['state'], 'running')
+        self.assertEqual(result['total'], 1)
+        self.assertNotIn(cid, self.control.recovery)
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 2)
+        fake_thread.return_value.start.assert_called_once()

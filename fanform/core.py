@@ -132,11 +132,32 @@ class Controller:
                               'Проверьте показания этого датчика в Proxmox.')
         return maximum
 
+    def _restore_recovery(self, cid):
+        """Restore the saved firmware mode on a deliberate new user action.
+
+        A failed hardware restore keeps the recovery record intact.
+        New manual setpoints still require the normal cooling preflight.
+        """
+        entry = self.recovery.get(cid)
+        if not entry:
+            return False
+        errors = hwmon.restore(entry, emergency=False)
+        if errors:
+            raise SafetyError('Не удалось восстановить исходный режим: ' + '; '.join(errors))
+        self.recovery.pop(cid, None)
+        self.targets.pop(cid, None)
+        self.drift_counts.pop(cid, None)
+        save_json(recovery_path(), self.recovery)
+        if not self.recovery:
+            self.alarm = None
+        return True
+
     def _remember(self, ch):
         if self.conflict:
             raise SafetyError('Обнаружен другой активный сервис управления вентиляторами. Остановите конфликтующий сервис.')
-        if ch['id'] in self.recovery:
-            raise SafetyError('После аварийного сброса сначала восстановите исходное управление')
+        # set_speed and set_mode checked temperatures before calling this.
+        # A stale recovery latch should not demand another button press.
+        self._restore_recovery(ch['id'])
         if ch['id'] not in self.originals:
             self.originals[ch['id']] = hwmon.snapshot(ch)
             save_json(STATE, self.originals)
@@ -233,17 +254,23 @@ class Controller:
     def firmware(self, cid):
         with self.lock:
             if self.job['state'] == 'running': raise SafetyError('Идёт калибровка')
-            original = self.originals.get(cid) or self.recovery.get(cid)
+            if cid in self.recovery:
+                self._restore_recovery(cid)
+                self.originals.pop(cid, None)
+                save_json(STATE, self.originals)
+                return {'restored': True}
+            original = self.originals.get(cid)
             if original:
-                self._temperature_check(start=True)
+                # Restoring saved firmware control is a recovery action, not
+                # an attempt to start a new lower-speed manual setpoint.
                 errors = hwmon.restore(original, emergency=False)
                 if errors: raise SafetyError('; '.join(errors))
                 self.originals.pop(cid, None)
-                self.recovery.pop(cid, None)
                 self.targets.pop(cid, None)
                 self.drift_counts.pop(cid, None)
                 save_json(STATE, self.originals)
-                save_json(recovery_path(), self.recovery)
+                if not self.recovery:
+                    self.alarm = None
                 return {'restored': True}
             raise SafetyError('Для этого канала нет сохранённого исходного режима')
 
@@ -298,17 +325,28 @@ class Controller:
             raise SafetyError('Нет работающих тахометров для автоопределения')
 
     def start_auto_test(self):
-        """One-click calibration of eligible channels, one at a time.
+        """One-click calibration; recover stale emergency channels first.
 
-        Never manipulate a channel with active manual or emergency state.
-        Read-only channels are displayed but not tested.
+        Manually controlled channels remain untouched. Recoverable channels
+        return to their saved state after the normal thermal preflight.
         """
         with self.lock:
             self._calibration_preflight()
             candidates = [c for c in hwmon.discover()[0] if c['writable']
-                          and c['id'] not in self.originals and c['id'] not in self.recovery]
+                          and c['id'] not in self.originals]
             if not candidates:
-                raise SafetyError('Нет свободных управляемых каналов. Сначала верните ручные каналы в BIOS.')
+                raise SafetyError('Нет доступных PWM-каналов. Каналы с ручным управлением сейчас заняты.')
+            available = []
+            restore_errors = []
+            for ch in candidates:
+                try:
+                    self._restore_recovery(ch['id'])
+                    available.append(ch)
+                except (OSError, SafetyError) as exc:
+                    restore_errors.append(f'{ch["name"]}: {exc}')
+            if not available:
+                raise SafetyError('Не удалось восстановить каналы: ' + '; '.join(restore_errors))
+            candidates = available
             self.calibration_abort.clear()
             self.job = {'state': 'running', 'message': 'Подготовка автопривязки тахометров',
                         'progress': 0, 'current': 0, 'total': len(candidates),
@@ -323,10 +361,11 @@ class Controller:
         with self.lock:
             self._calibration_preflight()
             ch = self.channel(cid)
-            if cid in self.originals or cid in self.recovery:
-                raise SafetyError('Верните исходное управление перед калибровкой')
+            if cid in self.originals:
+                raise SafetyError('Канал уже управляется вручную. Верните его в BIOS перед калибровкой.')
             if not ch['writable']:
                 raise SafetyError('Канал недоступен для управления')
+            self._restore_recovery(cid)
             self.calibration_abort.clear()
             self.job = {'state': 'running', 'message': 'Подготовка датчиков',
                         'progress': 0, 'current': 1, 'total': 1, 'results': [], 'channel': cid}
