@@ -157,3 +157,54 @@ class AdditionalSafetyTests(unittest.TestCase):
         self.assertEqual(hwmon.number(self.hw/'pwm1_enable'),1)
         self.assertEqual(hwmon.number(self.hw/'pwm1'),255)
         self.assertIn(cid,self.control.recovery)
+
+
+class ManualSetpointTests(unittest.TestCase):
+    setUp = FakeHwmon.setUp
+
+    def test_setpoint_is_exposed_and_readback_verified(self):
+        cid = hwmon.discover()[0][0]['id']
+        result = self.control.set_speed(cid, 90)
+        ch = self.control.inventory()['channels'][0]
+        self.assertTrue(result['verified'])
+        self.assertEqual(ch['target_pwm'], 230)
+        self.assertEqual(ch['value'], 230)
+        self.assertEqual(ch['control_drift'], 0)
+
+    def test_external_pwm_change_is_reapplied(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 90)
+        (self.hw/'pwm1').write_text('255')
+        (self.hw/'pwm1_enable').write_text('2')
+        self.control._monitor_once()
+        self.assertEqual(hwmon.number(self.hw/'pwm1'), 230)
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 1)
+        self.assertEqual(self.control.inventory()['channels'][0]['control_drift'], 1)
+        self.control._monitor_once()
+        self.assertEqual(self.control.inventory()['channels'][0]['control_drift'], 0)
+
+    def test_repeated_external_override_fails_safe_not_endless_fight(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 90)
+        for _ in range(3):
+            (self.hw/'pwm1').write_text('255')
+            self.control._monitor_once()
+        self.assertEqual(hwmon.number(self.hw/'pwm1'), 255)
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 1)
+        self.assertIn(cid, self.control.recovery)
+        self.assertIn('перезаписывается', self.control.alarm)
+        self.assertEqual(self.control.targets, {})
+
+    def test_firmware_clears_manual_target(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 90)
+        self.control.firmware(cid)
+        self.assertIsNone(self.control.inventory()['channels'][0]['target_pwm'])
+
+    def test_temperature_abort_still_active(self):
+        cid = hwmon.discover()[0][0]['id']
+        self.control.set_speed(cid, 90)
+        (self.hw/'temp1_input').write_text('79000')
+        self.control._monitor_once()
+        self.assertEqual(hwmon.number(self.hw/'pwm1'), 255)
+        self.assertIn('температура', self.control.alarm.lower())

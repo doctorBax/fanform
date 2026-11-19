@@ -55,6 +55,9 @@ class Controller:
         self.cfg.setdefault('groups', [])
         self.originals = load_json(STATE, {})
         self.recovery = load_json(recovery_path(), {})
+        # These setpoints are live-session controls, not automatically replayed after reboot.
+        self.targets = {}
+        self.drift_counts = {}
         self.conflict = any(subprocess.run(['systemctl','is-active','--quiet',unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 for unit in ('fancontrol.service', 'coolercontrold.service'))
         self.job = {'state': 'idle', 'message': 'Калибровка ещё не запускалась', 'progress': 0}
         self.alarm = None
@@ -70,6 +73,8 @@ class Controller:
             c['calibration'] = self.cfg['calibrations'].get(c['id'])
             c['active'] = c['id'] in self.originals
             c['recoverable'] = c['id'] in self.recovery
+            c['target_pwm'] = self.targets.get(c['id'])
+            c['control_drift'] = self.drift_counts.get(c['id'], 0)
         return {'channels': channels, 'fans': fans, 'temperatures': temps,
                 'groups': self.cfg['groups'], 'alarm': self.alarm, 'job': dict(self.job), 'conflict': self.conflict}
 
@@ -82,9 +87,11 @@ class Controller:
         temperatures = hwmon.discover()[2]
         if not temperatures:
             raise SafetyError('Нет температурных датчиков: управление заблокировано')
-        maximum = max(t['celsius'] for t in temperatures)
-        if maximum >= (MAX_START_TEMP if start else HIGH_TEMP):
-            raise SafetyError(f'Температура {maximum}°C: защита остановила операцию')
+        hottest = max(temperatures, key=lambda t: t['celsius'])
+        maximum = hottest['celsius']
+        threshold = MAX_START_TEMP if start else HIGH_TEMP
+        if maximum >= threshold:
+            raise SafetyError(f'Перегрев/высокая температура: {hottest["name"]} ({maximum}°C, порог {threshold}°C)')
         return maximum
 
     def _remember(self, ch):
@@ -108,7 +115,15 @@ class Controller:
             except OSError: pass
             hwmon.write(enable, 1)
             hwmon.write(Path(ch['path']), 255)
-        hwmon.write(Path(ch['path']), duty)
+        pwm = Path(ch['path'])
+        hwmon.write(pwm, duty)
+        # Some Super-I/O drivers/EC firmware silently reject or overwrite writes.
+        # A successful sysfs write alone does not prove the control is active.
+        if hwmon.number(enable) != 1 or hwmon.number(pwm) != duty:
+            hwmon.write(enable, 1)
+            hwmon.write(pwm, duty)
+            if hwmon.number(enable) != 1 or hwmon.number(pwm) != duty:
+                raise SafetyError('Контроллер отклонил ручной PWM: BIOS/EC или другой процесс перезаписывает уставку')
 
     def set_speed(self, cid, percent):
         with self.lock:
@@ -123,11 +138,15 @@ class Controller:
             duty = round(percent * 255 / 100)
             if duty < minimum:
                 raise SafetyError(f'Минимум для этого канала: {round(minimum / 255 * 100)}%')
-            try: self._write_pwm(ch, duty)
-            except OSError as e:
-                self.failsafe(f'Ошибка записи: {e}')
+            try:
+                self._write_pwm(ch, duty)
+                self.targets[cid] = duty
+                self.drift_counts[cid] = 0
+            except (OSError, SafetyError) as e:
+                if cid in self.originals:
+                    self.failsafe(f'Не удалось закрепить PWM: {e}')
                 raise SafetyError(str(e))
-            return {'channel': cid, 'pwm': duty}
+            return {'channel': cid, 'pwm': duty, 'verified': True}
 
     def set_mode(self, cid, mode):
         with self.lock:
@@ -158,6 +177,8 @@ class Controller:
                         raise SafetyError('RPM резко упали после смены режима')
                 self.cfg['calibrations'].pop(cid, None)
                 save_json(CONFIG, self.cfg)
+                self.targets[cid] = 255
+                self.drift_counts[cid] = 0
                 return {'mode': mode, 'note': 'Требуется повторная калибровка'}
             except (OSError, SafetyError):
                 restore_value = dict(original)
@@ -166,6 +187,8 @@ class Controller:
                 hwmon.restore(restore_value, emergency=False)  # revert the hardware output mode
                 if not previously_managed:
                     self.originals.pop(cid, None)
+                self.targets.pop(cid, None)
+                self.drift_counts.pop(cid, None)
                 save_json(STATE, self.originals)
                 raise
 
@@ -179,6 +202,8 @@ class Controller:
                 if errors: raise SafetyError('; '.join(errors))
                 self.originals.pop(cid, None)
                 self.recovery.pop(cid, None)
+                self.targets.pop(cid, None)
+                self.drift_counts.pop(cid, None)
                 save_json(STATE, self.originals)
                 save_json(recovery_path(), self.recovery)
                 return {'restored': True}
@@ -298,12 +323,14 @@ class Controller:
                 save_json(CONFIG, self.cfg)
                 self.job.update(state='complete', progress=100, message=f'Найден минимум {round(safe / 255 * 100)}%, тахометров: {len(linked)}')
             except (OSError, SafetyError, ValueError) as e:
-                emergency = isinstance(e, (OSError, StallDetected)) or any(word in str(e) for word in ('Температура', 'температурных'))
+                emergency = isinstance(e, (OSError, StallDetected)) or any(word in str(e).lower() for word in ('температур', 'перегрев'))
                 self.job.update(state='error', message=str(e), progress=0)
             finally:
                 if original:
                     hwmon.restore(original, emergency=emergency)
                     self.originals.pop(cid, None)
+                    self.targets.pop(cid, None)
+                    self.drift_counts.pop(cid, None)
                     save_json(STATE, self.originals)
                     if emergency:
                         self.recovery[cid] = original
@@ -318,25 +345,56 @@ class Controller:
             for entry in entries:
                 hwmon.restore(entry, emergency=True)
             self.originals = {}
+            self.targets.clear()
+            self.drift_counts.clear()
             save_json(STATE, self.originals)
+
+    def _monitor_once(self):
+        """Check manual setpoints and cooling, recover bounded transient interference.
+
+        Never fight another controller indefinitely: after 3 successive overrides,
+        fail safe to full fan output and expose the conflict to the web UI.
+        """
+        with self.lock:
+            if not self.originals or self.job['state'] == 'running':
+                return
+            try:
+                self._temperature_check()
+                if any(subprocess.run(['systemctl', 'is-active', '--quiet', unit],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                    for unit in ('fancontrol.service', 'coolercontrold.service')):
+                    self.conflict = True
+                    raise SafetyError('Запущен другой сервис управления вентиляторами')
+                channels, fans, _ = hwmon.discover()
+                channel_map = {c['id']: c for c in channels}
+                fan_map = {f['id']: f['rpm'] for f in fans}
+                for cid in self.originals:
+                    cal = self.cfg['calibrations'].get(cid)
+                    if cal and cal.get('fans'):
+                        for fid in cal['fans']:
+                            if fan_map.get(fid) is None or fan_map[fid] < 300:
+                                raise SafetyError(f'Потерян RPM: {fid}')
+                for cid, duty in list(self.targets.items()):
+                    ch = channel_map.get(cid)
+                    if not ch or not ch['writable']:
+                        raise SafetyError(f'Канал управления исчез: {cid}')
+                    current = hwmon.number(Path(ch['path']))
+                    enable = hwmon.number(Path(ch['enable_path']))
+                    if current != duty or enable != 1:
+                        count = self.drift_counts.get(cid, 0) + 1
+                        self.drift_counts[cid] = count
+                        if count >= 3:
+                            raise SafetyError(f'PWM {cid} перезаписывается BIOS/EC или другой программой')
+                        self._write_pwm(ch, duty)
+                    else:
+                        self.drift_counts[cid] = 0
+            except (SafetyError, OSError, ValueError) as exc:
+                self.failsafe(str(exc))
 
     def _watchdog(self):
         while self.active:
             time.sleep(2)
-            with self.lock:
-                if not self.originals or self.job['state'] == 'running':
-                    continue
-                try:
-                    self._temperature_check()
-                    fan_map = {f['id']: f['rpm'] for f in hwmon.discover()[1]}
-                    for cid in self.originals:
-                        cal = self.cfg['calibrations'].get(cid)
-                        if cal and cal['fans']:
-                            for fid in cal['fans']:
-                                if fan_map.get(fid) is None or fan_map[fid] < 300:
-                                    raise SafetyError(f'Потерян RPM: {fid}')
-                except (SafetyError, OSError) as e:
-                    self.failsafe(str(e))
+            self._monitor_once()
 
     def shutdown(self):
         self.active = False
@@ -344,6 +402,8 @@ class Controller:
             for entry in self.originals.values():
                 hwmon.restore(entry, emergency=False)
             self.originals = {}
+            self.targets.clear()
+            self.drift_counts.clear()
             save_json(STATE, self.originals)
 
 

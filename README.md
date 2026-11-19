@@ -53,6 +53,14 @@ Safeguards: no calibration with max reported temperature ≥65°C; test abort at
 
 **DC mode** is available only if the controller provides a writable `pwmN_mode` (Linux documents 0=DC, 1=PWM). This toggles the motherboard's hardware output mode, not an arbitrary voltage. The software cannot guarantee that the header and 3-pin fan support safe voltage regulation. Switch modes only with hardware knowledge, and recalibrate afterward. The detection is correlational, not perfect physical tracing.
 
+## Manual setpoints and external overrides
+
+Fanform now reports the **requested manual PWM setpoint** separately from the hardware readback and RPM. When setting a speed, Fanform switches `pwmN_enable` to manual, writes `pwmN`, and verifies the readback. The watchdog checks the requested setpoint every 2 seconds and can reassert it after a transient override. It deliberately does not fight an embedded controller indefinitely: after 3 successive overrides, it enters full-output failsafe and shows the conflict in the dashboard. An active `fancontrol` or `coolercontrold` service is treated as a control conflict.
+
+Manual setpoints remain active while Fanform runs, but are **not automatically restored after a daemon restart or reboot**; restoring unknown low cooling on startup is unsafe. A UI slider preserves unsaved changes across routine refreshes. Hardware RPM can still vary even with an unchanged PWM value, and some BIOS/EC controllers are not software-controllable from Linux. Proxmox itself does not generally implement a fan curve.
+
+The temperature cutoff during calibration remains enabled; the error now identifies the sensor and threshold responsible. If a seemingly unrelated sensor triggers it, collect the sensor labels and readings for diagnosis rather than disabling thermal fail-safe protection.
+
 ## Limitations
 
 - Some motherboards expose tachometers without any writable fan control. They are displayed as read-only.
