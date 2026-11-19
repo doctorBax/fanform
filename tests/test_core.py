@@ -286,3 +286,30 @@ class AssistedMappingTests(unittest.TestCase):
             self.control._calibrate(cid)
         self.assertEqual(self.control.job['state'], 'error')
         self.assertFalse(self.control.cfg['calibrations'])
+
+
+class RepeatConfirmationTests(unittest.TestCase):
+    setUp = FakeHwmon.setUp
+
+    def test_single_step_reaction_confirms_mapping(self):
+        cid = hwmon.discover()[0][0]['id']
+        old_write = hwmon.write
+        def change(path, duty):
+            old_write(path, duty)
+            if path.name=='pwm1':
+                (self.hw/'fan1_input').write_text(str(1500 if duty>=205 else round(1500*duty/205)))
+        with mock.patch.object(hwmon,'write',side_effect=change), mock.patch.object(core.time,'sleep',lambda _: None):
+            self.control._calibrate(cid)
+        self.assertEqual(self.control.job['state'],'complete')
+        details = self.control.job['results'][0]['response_curve']
+        record = next(iter(details.values()))
+        self.assertTrue(record['matched'])
+        self.assertIn('rpm_confirmed_low', record)
+        self.assertIn('rpm_confirmed_high', record)
+
+    def test_unresponsive_sensor_is_not_linked(self):
+        cid=hwmon.discover()[0][0]['id']
+        with mock.patch.object(core.time,'sleep',lambda _: None):
+            self.control._calibrate(cid)
+        self.assertEqual(self.control.job['state'],'error')
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'),2)

@@ -20,3 +20,9 @@
 .linked-fans strong{color:var(--lime);font-size:12px;font-weight:600}
 .fan-separator{color:#5d645c;padding:0 4px}
 @media(max-width:560px){.section-heading:has(.test-actions){align-items:flex-start;gap:12px;flex-direction:column}.test-actions{width:100%;justify-content:space-between}.autotest-button{width:100%}.calibration-panel{padding:18px}.calibration-result{align-items:flex-start}}
+
+.calibration-result{display:block}
+.calibration-result p{margin:4px 0 0;line-height:1.6}
+.calibration-details{margin-top:8px;color:var(--muted);font-size:11px}
+.calibration-details summary{cursor:pointer;user-select:none}
+.calibration-details div{margin:5px 0 0;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}

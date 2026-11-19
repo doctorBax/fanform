@@ -108,3 +108,12 @@ This is a Fan Control-style approach, not a copy of proprietary code. No RPM
 response can also mean that BIOS/EC overrides the control, an input-only
 sensor, or a fan that cannot be matched reliably. An unconfirmed pairing is
 reported as such rather than guessed.
+
+### Assisted RPM pairing diagnostics
+
+Assisted pairing waits for tachometer stabilization, uses median RPM samples
+across several PWM levels, and repeats a confirmation pulse before saving
+RPM/PWM associations. Per-channel RPM response curves are visible under
+**Измерения RPM** after autocalibration, including failed mappings. A 3-pin DC
+fan that cannot change RPM in PWM mode is reported without guessing a mapping.
+Electrical PWM/DC mode is never changed automatically.

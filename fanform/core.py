@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+from statistics import median
 import subprocess
 import threading
 import time
@@ -337,22 +338,25 @@ class Controller:
         if self.calibration_abort.is_set() or not self.active:
             raise SafetyError('Автотест прерван: восстановлено управление охлаждением')
 
-    def _measure(self, seconds=3, baseline=None, monitored=None):
+    def _measure(self, seconds=3, baseline=None, monitored=None, settle=0):
+        """Median RPM sample after settle time. Check safety on every poll."""
         values = {}
         samples = max(1, int(seconds / .5))
-        for _ in range(samples):
+        settling = max(0, int(settle / .5))
+        for index in range(samples + settling):
             self._ensure_running()
             self._temperature_check()
-            current = {f['id']:f['rpm'] for f in hwmon.discover()[1]}
+            current = {f['id']: f['rpm'] for f in hwmon.discover()[1]}
             for fid in monitored or []:
                 rpm = current.get(fid)
                 if rpm is None or rpm < max(350, baseline[fid] * .25):
                     raise StallDetected(f'Потеря оборотов: {fid}')
-            for fid, rpm in current.items():
-                if rpm is not None:
-                    values.setdefault(fid, []).append(rpm)
+            if index >= settling:
+                for fid, rpm in current.items():
+                    if rpm is not None:
+                        values.setdefault(fid, []).append(rpm)
             time.sleep(.5)
-        return {fid: round(sum(v) / len(v)) for fid, v in values.items()}
+        return {fid: round(median(v)) for fid, v in values.items()}
 
     def _calibrate_channel(self, cid, progress):
         """Map RPM changes to exactly one PWM channel, then measure safe floor.
@@ -371,7 +375,7 @@ class Controller:
             original = hwmon.snapshot(ch)
             self._write_pwm(ch, 255)
             progress(8, 'Измеряю RPM на полной мощности')
-            baseline = self._measure(3)
+            baseline = self._measure(3, settle=2)
             # Assisted pairing: measure several response points, not just 255->210.
             # Some fans have a wide 100% plateau or need time to settle.
             strong = {fid: rpm for fid, rpm in baseline.items() if rpm >= 300}
@@ -382,12 +386,12 @@ class Controller:
                 self._ensure_running()
                 self._write_pwm(ch, duty)
                 progress(stage, f'Поиск отклика RPM · мощность {round(duty / 255 * 100)}%')
-                sample = self._measure(3, baseline=strong, monitored=list(strong))
+                sample = self._measure(3, baseline=strong, monitored=list(strong), settle=2)
                 observations.append((duty, sample))
             self._ensure_running()
             self._write_pwm(ch, 255)
             progress(33, 'Проверяю восстановление оборотов')
-            recovered = self._measure(3, baseline=strong, monitored=list(strong))
+            recovered = self._measure(3, baseline=strong, monitored=list(strong), settle=2)
             linked = []
             response = {}
             for fid, high in strong.items():
@@ -400,17 +404,40 @@ class Controller:
                 significant_steps = sum(x >= max(20, high * .025) for x in individual_drops)
                 monotonic = all(series[k + 1] <= series[k] + max(45, high * .06) for k in range(3))
                 recovered_enough = up >= high * .88 and up >= series[-1] + max(45, high * .08)
-                matched = (delta >= max(65, high * .10) and significant_steps >= 2
+                matched = (delta >= max(65, high * .10) and significant_steps >= 1
                            and monotonic and recovered_enough)
                 response[fid] = {'rpm_at_100': high, 'rpm_at_84': series[1],
                                  'rpm_at_69': series[2], 'rpm_at_59': series[3],
                                  'rpm_recovered': up, 'matched': matched}
                 if matched:
                     linked.append(fid)
+            # A second reversible pulse rejects transient tachometer noise.
+            if linked:
+                self._ensure_running()
+                progress(33, 'Подтверждаю RPM повторным воздействием')
+                self._write_pwm(ch, 150)
+                confirmation_low = self._measure(3, baseline=strong, monitored=linked, settle=2)
+                self._write_pwm(ch, 255)
+                confirmation_high = self._measure(3, baseline=strong, monitored=linked, settle=2)
+                confirmed = []
+                for fid in linked:
+                    low_rpm = confirmation_low.get(fid)
+                    high_rpm = confirmation_high.get(fid)
+                    baseline_rpm = strong[fid]
+                    verified = (low_rpm is not None and high_rpm is not None
+                                and baseline_rpm - low_rpm >= max(65, baseline_rpm * .10)
+                                and high_rpm - low_rpm >= max(50, baseline_rpm * .08)
+                                and high_rpm >= baseline_rpm * .86)
+                    response[fid].update(rpm_confirmed_low=low_rpm,
+                                         rpm_confirmed_high=high_rpm, matched=verified)
+                    if verified:
+                        confirmed.append(fid)
+                linked = confirmed
+            result['response_curve'] = response
             if not linked:
                 raise SafetyError('PWM менялся, но ни один RPM не показал устойчивого '
                                   'отклика на 84→69→59% с возвратом к 100%. '
-                                  'Проверьте управление BIOS/EC и соответствие датчиков.')
+                                  'Проверьте DC/PWM, BIOS/EC и тахометры. Откройте измерения ниже.')
             progress(35, f'Найдено связанных тахометров: {len(linked)}')
             lowest = 210
             sequence = [190, 170, 150, 130, 115, 100, 85, 70, 60]
@@ -420,7 +447,7 @@ class Controller:
                          f'Проверяю нижний предел · {round(duty / 255 * 100)}%')
                 self._write_pwm(ch, duty)
                 try:
-                    self._measure(3, baseline=strong, monitored=linked)
+                    self._measure(3, baseline=strong, monitored=linked, settle=1)
                 except StallDetected:
                     self._write_pwm(ch, 255)
                     break
