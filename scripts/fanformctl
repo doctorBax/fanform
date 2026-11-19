@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+export PYTHONPATH=/opt/fanform
+exec /usr/bin/python3 -m fanform.cli "$@"

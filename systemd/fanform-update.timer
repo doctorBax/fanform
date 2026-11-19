@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Fanform update check
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=fanform-update.service
+
+[Install]
+WantedBy=timers.target

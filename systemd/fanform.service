@@ -1,0 +1,23 @@
+[Unit]
+Description=Fanform hardware cooling controller
+After=local-fs.target network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fanform
+Environment=PYTHONPATH=/opt/fanform
+ExecStart=/usr/bin/python3 -m fanform.server
+ExecStopPost=/usr/bin/python3 -m fanform.cli --emergency
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/etc/fanform /var/lib/fanform
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
