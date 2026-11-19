@@ -7,7 +7,13 @@
 <div id="dashboard" hidden><section class="hero"><div><p class="eyebrow">LIVE HARDWARE / HOST</p><h1>Cooling<span class="title-period">.</span></h1><p class="hero-caption">Каждый канал на своём месте. Без догадок и лишнего шума.</p></div><div class="temp-display"><span class="small-label">MAX SENSOR TEMP</span><div class="temp-number" id="hero-temp">—<span>°C</span></div><span class="temp-foot" id="temp-count">Ожидание датчиков</span></div></section>
 <div class="notice" id="notice" hidden></div>
 <section class="metric-grid" id="metrics"></section>
-<div class="section-heading"><div><p class="eyebrow">01 / CONTROL</p><h2>Вентиляторы</h2></div><span class="small-label" id="fan-count">—</span></div><section class="fan-grid" id="channels"></section>
+<div class="section-heading"><div><p class="eyebrow">01 / CONTROL</p><h2>Вентиляторы</h2></div><div class="test-actions"><span class="small-label" id="fan-count">—</span><button class="primary autotest-button" id="calibrate-all" type="button">Автотест всех вентиляторов <span aria-hidden="true">↗</span></button></div></div>
+<section class="calibration-panel" id="calibration-panel" hidden aria-live="polite">
+<div class="calibration-header"><div><span class="eyebrow">АВТОПРИВЯЗКА / RPM → PWM</span><h3 id="calibration-title">Автотест</h3></div><span class="calibration-count" id="calibration-percent">0%</span></div>
+<progress id="calibration-progress" value="0" max="100" aria-label="Прогресс автотеста"></progress>
+<div class="calibration-message" id="calibration-message"></div>
+<div class="calibration-results" id="calibration-results"></div>
+</section><section class="fan-grid" id="channels"></section>
 <div class="section-heading groups-heading"><div><p class="eyebrow">02 / COLLECTIONS</p><h2>Группы</h2></div><button class="outline" id="group-open">+ Новая группа</button></div><section id="groups" class="groups"></section>
 <div class="section-heading"><div><p class="eyebrow">03 / SENSORS</p><h2>Датчики</h2></div></div><section id="sensors" class="sensor-list"></section>
 <section class="safety"><div><span class="safety-icon">!</span><div><strong>Safety first</strong><p>При перегреве, потере тахометра или ошибке управления Fanform подаст максимальную мощность. Тестировать вентиляторы следует при минимальной нагрузке.</p></div></div><button class="danger" id="panic">Аварийный сброс ↗</button></section>

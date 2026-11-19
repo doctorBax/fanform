@@ -41,25 +41,37 @@ sudo fanformctl --uninstall
 
 Automatic updates are disabled by default; a systemd timer can update only if the install comes from a real Git repository. Run with trusted supply-chain practices; a hosted repository can publish unreviewed changes. **Uninstall removes settings and calibration records too.**
 
-## Calibration procedure
+## One-button automatic calibration and RPM mapping
 
-1. At low workload, click **Автотест** on one writable channel. Other settings are locked during calibration.
-2. Fanform sets that channel to maximum, measures tachometers, drops to 210/255 briefly, and checks which tachometers slow down and recover.
-3. If at least one tachometer reliably follows that channel, it lowers the setting in steps, while checking both temperatures and RPM. It does **not** deliberately stop the fan.
-4. It records the lowest observed stable setting + 20/255 margin (at least 85/255). It restores the original control settings after calibration.
-5. Until successful tachometer calibration, manual controls are limited to at least 180/255 (~71%) and mode-switching should only be attempted with a working tachometer.
+The dashboard contains **one `Автотест всех вентиляторов` button**. It runs a single
+batch job over every available, writable PWM/DC channel, one channel at a time.
+Channels currently in manual control or in emergency recovery are deliberately
+skipped; restore them to firmware first if they also need calibration. Read-only
+sensors remain visible but are not operated.
 
-Safeguards: no calibration with max reported temperature ≥65°C; test abort at ≥75°C or on insufficient RPM; missing temperature readings prohibit new control. When a previously mapped fan reports <300 RPM, emergency recovery sets the channel to 100%; if the firmware had an automatic mode that was captured, it remains an option for recovery. Linux or a full host hang cannot be rescued by a userspace daemon. Thermal readings and tachometer mapping are not equivalent to guaranteed cooling capacity.
+The button starts a background job and exposes live per-channel progress through
+`GET /api/state`. The web UI shows the overall progress bar, currently tested
+channel, and results as they arrive, without blocking polling. The old
+`POST /api/calibrate` endpoint remains available for legacy clients; the new
+`POST /api/calibrate/all` starts the batch.
 
-**DC mode** is available only if the controller provides a writable `pwmN_mode` (Linux documents 0=DC, 1=PWM). This toggles the motherboard's hardware output mode, not an arbitrary voltage. The software cannot guarantee that the header and 3-pin fan support safe voltage regulation. Switch modes only with hardware knowledge, and recalibrate afterward. The detection is correlational, not perfect physical tracing.
+For each channel the test measures RPM at full output, temporarily lowers output
+for correlation, verifies that any matching RPM rises again, then cautiously tests
+the minimum sustained output and saves a margin above it. The confirmed RPM
+sensor(s) and their **live RPM readings appear on the corresponding slider card**.
+Ambiguous RPM-to-PWM mappings are discarded, rather than presented as fact.
+No manual mode is left active following a completed test.
 
-## Manual setpoints and external overrides
+The UI does not show routine temperature alert banners or popup messages. Actual
+temperatures remain visible as sensor readings. **The backend emergency thermal
+and stall checks remain enabled**: hardware safety overrides convenience, and
+a test aborts automatically on hazardous conditions. Never run calibration under
+heavy load or without adequate redundant cooling. Some boards do not allow
+software fan control despite exposing tachometer sensors.
 
-Fanform now reports the **requested manual PWM setpoint** separately from the hardware readback and RPM. When setting a speed, Fanform switches `pwmN_enable` to manual, writes `pwmN`, and verifies the readback. The watchdog checks the requested setpoint every 2 seconds and can reassert it after a transient override. It deliberately does not fight an embedded controller indefinitely: after 3 successive overrides, it enters full-output failsafe and shows the conflict in the dashboard. An active `fancontrol` or `coolercontrold` service is treated as a control conflict.
-
-Manual setpoints remain active while Fanform runs, but are **not automatically restored after a daemon restart or reboot**; restoring unknown low cooling on startup is unsafe. A UI slider preserves unsaved changes across routine refreshes. Hardware RPM can still vary even with an unchanged PWM value, and some BIOS/EC controllers are not software-controllable from Linux. Proxmox itself does not generally implement a fan curve.
-
-The temperature cutoff during calibration remains enabled; the error now identifies the sensor and threshold responsible. If a seemingly unrelated sensor triggers it, collect the sensor labels and readings for diagnosis rather than disabling thermal fail-safe protection.
+**DC mode** is offered only where the Linux controller exposes a writable
+`pwmN_mode` (0 = DC, 1 = PWM), and it requires an explicit selection. A 3-pin fan
+alone does not prove the motherboard can regulate that header's voltage.
 
 ## Limitations
 

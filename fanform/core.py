@@ -59,7 +59,9 @@ class Controller:
         self.targets = {}
         self.drift_counts = {}
         self.conflict = any(subprocess.run(['systemctl','is-active','--quiet',unit], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 for unit in ('fancontrol.service', 'coolercontrold.service'))
-        self.job = {'state': 'idle', 'message': 'Калибровка ещё не запускалась', 'progress': 0}
+        self.job = {'state': 'idle', 'message': 'Автотест ещё не запускался', 'progress': 0, 'results': []}
+        self.calibration_abort = threading.Event()
+        self.calibration_thread = None
         self.alarm = None
         self.active = True
         # On service restart, assume previous manual control may have been orphaned.
@@ -69,14 +71,18 @@ class Controller:
 
     def inventory(self):
         channels, fans, temps = hwmon.discover()
+        by_id = {fan['id']: fan for fan in fans}
         for c in channels:
+            cal = self.cfg['calibrations'].get(c['id'])
+            c['linked_fans'] = [dict(id=fid, name=by_id[fid]['name'], rpm=by_id[fid]['rpm'])
+                                for fid in (cal or {}).get('fans', []) if fid in by_id]
             c['calibration'] = self.cfg['calibrations'].get(c['id'])
             c['active'] = c['id'] in self.originals
             c['recoverable'] = c['id'] in self.recovery
             c['target_pwm'] = self.targets.get(c['id'])
             c['control_drift'] = self.drift_counts.get(c['id'], 0)
         return {'channels': channels, 'fans': fans, 'temperatures': temps,
-                'groups': self.cfg['groups'], 'alarm': self.alarm, 'job': dict(self.job), 'conflict': self.conflict}
+                'groups': self.cfg['groups'], 'alarm': self.alarm, 'job': {**self.job, 'results': [dict(result) for result in self.job.get('results', [])]}, 'conflict': self.conflict}
 
     def channel(self, cid):
         for c in hwmon.discover()[0]:
@@ -250,23 +256,61 @@ class Controller:
                 raise
             return {'updated': len(groups[0]['channels'])}
 
-    def start_calibration(self, cid):
+    def _calibration_preflight(self):
+        if self.job['state'] == 'running':
+            raise SafetyError('Автотест уже выполняется')
+        if self.conflict:
+            raise SafetyError('Обнаружен другой сервис управления вентиляторами')
+        self._temperature_check(start=True)
+        if not any((f['rpm'] or 0) >= 500 for f in hwmon.discover()[1]):
+            raise SafetyError('Нет работающих тахометров для автоопределения')
+
+    def start_auto_test(self):
+        """One-click calibration of eligible channels, one at a time.
+
+        Never manipulate a channel with active manual or emergency state.
+        Read-only channels are displayed but not tested.
+        """
         with self.lock:
-            if self.job['state'] == 'running': raise SafetyError('Калибровка уже выполняется')
+            self._calibration_preflight()
+            candidates = [c for c in hwmon.discover()[0] if c['writable']
+                          and c['id'] not in self.originals and c['id'] not in self.recovery]
+            if not candidates:
+                raise SafetyError('Нет свободных управляемых каналов. Сначала верните ручные каналы в BIOS.')
+            self.calibration_abort.clear()
+            self.job = {'state': 'running', 'message': 'Подготовка автопривязки тахометров',
+                        'progress': 0, 'current': 0, 'total': len(candidates),
+                        'results': []}
+            self.calibration_thread = threading.Thread(
+                target=self._calibrate_all, args=(candidates,), daemon=True)
+            self.calibration_thread.start()
+            return {**self.job, 'results': []}
+
+    def start_calibration(self, cid):
+        """Legacy per-channel endpoint retained for existing API clients."""
+        with self.lock:
+            self._calibration_preflight()
             ch = self.channel(cid)
-            if cid in self.originals or cid in self.recovery: raise SafetyError('Верните исходное управление перед калибровкой')
-            if not ch['writable']: raise SafetyError('Канал недоступен для управления')
-            self._temperature_check(start=True)
-            if not any((f['rpm'] or 0) >= 500 for f in hwmon.discover()[1]):
-                raise SafetyError('Нет работающих тахометров для автоопределения')
-            self.job = {'state': 'running', 'message': 'Подготовка датчиков', 'progress': 0, 'channel': cid}
-            threading.Thread(target=self._calibrate, args=(cid,), daemon=True).start()
+            if cid in self.originals or cid in self.recovery:
+                raise SafetyError('Верните исходное управление перед калибровкой')
+            if not ch['writable']:
+                raise SafetyError('Канал недоступен для управления')
+            self.calibration_abort.clear()
+            self.job = {'state': 'running', 'message': 'Подготовка датчиков',
+                        'progress': 0, 'current': 1, 'total': 1, 'results': [], 'channel': cid}
+            self.calibration_thread = threading.Thread(target=self._calibrate, args=(cid,), daemon=True)
+            self.calibration_thread.start()
             return dict(self.job)
+
+    def _ensure_running(self):
+        if self.calibration_abort.is_set() or not self.active:
+            raise SafetyError('Автотест прерван: восстановлено управление охлаждением')
 
     def _measure(self, seconds=3, baseline=None, monitored=None):
         values = {}
         samples = max(1, int(seconds / .5))
         for _ in range(samples):
+            self._ensure_running()
             self._temperature_check()
             current = {f['id']:f['rpm'] for f in hwmon.discover()[1]}
             for fid in monitored or []:
@@ -279,64 +323,143 @@ class Controller:
             time.sleep(.5)
         return {fid: round(sum(v) / len(v)) for fid, v in values.items()}
 
+    def _calibrate_channel(self, cid, progress):
+        """Map RPM changes to exactly one PWM channel, then measure safe floor.
+
+        Lock is deliberately not held across sleeps, so /api/state can poll progress.
+        Manual mutations are separately rejected while job.state == running.
+        """
+        original = None
+        emergency = False
+        result = {'channel': cid, 'name': cid, 'status': 'error', 'fans': []}
+        try:
+            ch = self.channel(cid)
+            result['name'] = ch['name']
+            self._ensure_running()
+            self._temperature_check(start=True)
+            original = hwmon.snapshot(ch)
+            self._write_pwm(ch, 255)
+            progress(8, 'Измеряю RPM на полной мощности')
+            baseline = self._measure(3)
+            strong = {fid: rpm for fid, rpm in baseline.items() if rpm >= 500}
+            if not strong:
+                raise SafetyError('Нет тахометров с RPM ≥500')
+            self._ensure_running()
+            self._write_pwm(ch, 210)
+            progress(22, 'Сопоставляю PWM с тахометрами')
+            low = self._measure(3, baseline=strong, monitored=list(strong))
+            linked = [fid for fid, rpm in strong.items()
+                      if fid in low and rpm - low[fid] >= max(120, rpm * .12)]
+            self._ensure_running()
+            self._write_pwm(ch, 255)
+            recovered = self._measure(3)
+            linked = [fid for fid in linked if fid in recovered and recovered[fid] >= baseline[fid] * .85]
+            if not linked:
+                raise SafetyError('Нет надёжного соответствия PWM → RPM; канал не привязан')
+            progress(35, f'Найдено связанных тахометров: {len(linked)}')
+            lowest = 210
+            sequence = [190, 170, 150, 130, 115, 100, 85, 70, 60]
+            for index, duty in enumerate(sequence):
+                self._ensure_running()
+                progress(35 + round(56 * index / len(sequence)),
+                         f'Проверяю нижний предел · {round(duty / 255 * 100)}%')
+                self._write_pwm(ch, duty)
+                try:
+                    self._measure(3, baseline=strong, monitored=linked)
+                except StallDetected:
+                    self._write_pwm(ch, 255)
+                    break
+                lowest = duty
+            self._ensure_running()
+            safe = min(255, max(lowest + 20, 85))
+            calibration = {'fans': linked, 'safe_pwm': safe,
+                           'baseline_rpm': {fid: strong[fid] for fid in linked},
+                           'tested_mode': hwmon.number(Path(ch['mode_path'])) if ch['mode_path'] else None,
+                           'measured_at': int(time.time())}
+            self.cfg['calibrations'][cid] = calibration
+            save_json(CONFIG, self.cfg)
+            result.update(status='mapped', fans=linked, safe_pwm=safe,
+                          message=f'{len(linked)} датчик(а) привязано')
+            progress(100, 'Привязка сохранена')
+        except (OSError, SafetyError, ValueError) as error:
+            emergency = (isinstance(error, (OSError, StallDetected))
+                         or self.calibration_abort.is_set()
+                         or any(word in str(error).lower() for word in ('температур', 'перегрев')))
+            result.update(status='error', message=str(error), emergency=emergency)
+        finally:
+            if original:
+                errors = hwmon.restore(original, emergency=emergency)
+                if errors:
+                    emergency = True
+                    hwmon.restore(original, emergency=True)
+                    result.update(status='error', message='Не удалось восстановить аппаратный режим',
+                                  emergency=True)
+                self.originals.pop(cid, None)
+                self.targets.pop(cid, None)
+                self.drift_counts.pop(cid, None)
+                save_json(STATE, self.originals)
+                if emergency:
+                    self.recovery[cid] = original
+                    save_json(recovery_path(), self.recovery)
+        return result
+
     def _calibrate(self, cid):
-        # Whole calibration locks out other writers. Never sends duty 0.
-        with self.lock:
-            ch = None
-            original = None
-            emergency = False
-            try:
-                ch = self.channel(cid)
-                self._temperature_check(start=True)
-                original = hwmon.snapshot(ch)
-                self._write_pwm(ch, 255)
-                self.job.update(message='Измерение на полной скорости', progress=8)
-                baseline = self._measure(3)
-                strong = {f: rpm for f, rpm in baseline.items() if rpm >= 500}
-                if not strong: raise SafetyError('Нет тахометров с RPM ≥500')
-                self._write_pwm(ch, 210)
-                self.job.update(message='Определяю связанные тахометры', progress=22)
-                low = self._measure(3, baseline=strong, monitored=list(strong))
-                linked = [f for f, rpm in strong.items() if f in low and rpm - low[f] >= max(120, rpm * .12)]
-                # Confirm recovery to distinguish workload fluctuations / unrelated fans.
-                self._write_pwm(ch, 255)
-                recovered = self._measure(3)
-                linked = [f for f in linked if f in recovered and recovered[f] >= baseline[f] * .85]
-                if not linked: raise SafetyError('Не удалось надёжно сопоставить PWM и RPM (контроль оставлен без изменений)')
-                lowest = 210
-                sequence = [190, 170, 150, 130, 115, 100, 85, 70, 60]
-                for i, duty in enumerate(sequence):
-                    self.job.update(message=f'Поиск устойчивого минимума · {round(duty / 255 * 100)}%',
-                                    progress=35 + round(56 * i / len(sequence)))
-                    self._write_pwm(ch, duty)
-                    try:
-                        self._measure(3, baseline=strong, monitored=linked)
-                    except StallDetected:
-                        self._write_pwm(ch, 255)  # immediate recovery; keep last good step
-                        break
-                    lowest = duty
-                # Reserve >= 20/255 above the lowest observed stable point.
-                safe = min(255, max(lowest + 20, 85))
-                self.cfg['calibrations'][cid] = {'fans': linked, 'safe_pwm': safe,
-                    'baseline_rpm': {f: strong[f] for f in linked}, 'tested_mode': hwmon.number(Path(ch['mode_path'])) if ch['mode_path'] else None,
-                    'measured_at': int(time.time())}
+        """Compatibility wrapper for single-channel calibration and unit tests."""
+        def progress(percent, message):
+            self.job.update(message=message, progress=percent)
+        result = self._calibrate_channel(cid, progress)
+        self.job.update(state='complete' if result['status'] == 'mapped' else 'error',
+                        progress=100 if result['status'] == 'mapped' else 0,
+                        message=result['message'], results=[result])
+
+    def _calibrate_all(self, candidates):
+        results = []
+        total = len(candidates)
+        for index, ch in enumerate(candidates):
+            if self.calibration_abort.is_set() or not self.active:
+                break
+            self.job.update(current=index + 1, channel=ch['id'],
+                            message=f'{ch["name"]}: подготовка')
+            def progress(percent, message):
+                self.job.update(progress=min(99, round((index + percent/100) / total * 100)),
+                                message=f'{ch["name"]} · {message}')
+            result = self._calibrate_channel(ch['id'], progress)
+            results.append(result)
+            if result['status'] != 'mapped' and ch['id'] in self.cfg['calibrations']:
+                # A failed retest must not leave a misleading old RPM-to-PWM link.
+                self.cfg['calibrations'].pop(ch['id'], None)
                 save_json(CONFIG, self.cfg)
-                self.job.update(state='complete', progress=100, message=f'Найден минимум {round(safe / 255 * 100)}%, тахометров: {len(linked)}')
-            except (OSError, SafetyError, ValueError) as e:
-                emergency = isinstance(e, (OSError, StallDetected)) or any(word in str(e).lower() for word in ('температур', 'перегрев'))
-                self.job.update(state='error', message=str(e), progress=0)
-            finally:
-                if original:
-                    hwmon.restore(original, emergency=emergency)
-                    self.originals.pop(cid, None)
-                    self.targets.pop(cid, None)
-                    self.drift_counts.pop(cid, None)
-                    save_json(STATE, self.originals)
-                    if emergency:
-                        self.recovery[cid] = original
-                        save_json(recovery_path(), self.recovery)
+            self.job['results'] = [dict(item) for item in results]
+            if result.get('emergency'):
+                break
+
+        # Mapping isn't proven when the same RPM sensor follows multiple headers.
+        # Reject such relationships instead of showing contradictory slider labels.
+        attached = {}
+        for item in results:
+            if item['status'] == 'mapped':
+                for fid in item['fans']:
+                    attached.setdefault(fid, []).append(item)
+        ambiguous = {item['channel'] for owners in attached.values() if len(owners) > 1
+                     for item in owners}
+        if ambiguous:
+            for item in results:
+                if item['channel'] in ambiguous:
+                    item.update(status='error', fans=[],
+                                message='Неоднозначная привязка: один RPM соответствует нескольким PWM')
+                    self.cfg['calibrations'].pop(item['channel'], None)
+            save_json(CONFIG, self.cfg)
+        complete = sum(item['status'] == 'mapped' for item in results)
+        failed = len(results) - complete
+        interrupted = len(results) < total
+        self.job.update(state='error' if interrupted else 'complete', progress=100,
+                        current=len(results), channel=None, results=[dict(item) for item in results],
+                        message=(f'Прервано: обработано {len(results)} из {total}' if interrupted
+                                 else f'Готово: {complete} привязано, {failed} без соответствия'))
 
     def failsafe(self, reason):
+        if self.job["state"] == "running":
+            self.calibration_abort.set()
         with self.lock:
             self.alarm = reason
             self.recovery.update(self.originals)
@@ -397,7 +520,10 @@ class Controller:
             self._monitor_once()
 
     def shutdown(self):
+        self.calibration_abort.set()
         self.active = False
+        if self.calibration_thread and self.calibration_thread.is_alive():
+            self.calibration_thread.join(timeout=5)
         with self.lock:
             for entry in self.originals.values():
                 hwmon.restore(entry, emergency=False)

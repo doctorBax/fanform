@@ -118,6 +118,8 @@ class API(BaseHTTPRequestHandler):
                 result = self.controller.firmware(data.get('channel'))
             elif path == '/api/calibrate':
                 result = self.controller.start_calibration(data.get('channel'))
+            elif path == '/api/calibrate/all':
+                result = self.controller.start_auto_test()
             elif path == '/api/group/create':
                 result = self.controller.group_save(data.get('name'), data.get('channels'))
             elif path == '/api/group/delete':

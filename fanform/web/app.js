@@ -4,6 +4,7 @@ const $ = (s) => document.querySelector(s);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let state = null, authenticated = false, editUntil = 0;
 const drafts = new Map(), groupDrafts = new Map();
+const visibleError = (message) => /температур|перегрев/i.test(message) ? 'Защита охлаждения отклонила операцию' : message;
 const toast = (message) => { const t = $('#toast'); t.textContent = message; t.classList.add('visible'); setTimeout(() => t.classList.remove('visible'), 4000); };
 async function api(path, body) {
   const options = body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json','X-Fanform-Request':'1'}, body:JSON.stringify(body)};
@@ -23,14 +24,17 @@ function card(ch) {
  const pct = drafts.has(ch.id) ? drafts.get(ch.id) : (typeof requested === 'number' ? Math.round(requested/255*100) : 100);
  const min = Math.ceil(threshold / 255 * 100);
  const badge = disabled ? 'READ ONLY' : (ch.active ? 'MANUAL' : 'FIRMWARE');
- const sub = linked ? `${linked} RPM-сенсор(а) · нижняя граница ${min}%` : 'Связанные тахометры ещё не определены';
+ const liveFans = ch.linked_fans || [];
+ const sub = linked ? `${linked} RPM-датчик(а) · нижняя граница ${min}%` : 'Тахометр пока не привязан';
+ const fanNames = liveFans.length ? liveFans.map(f => `${esc(f.name)} · <strong>${f.rpm === null ? '—' : Number(f.rpm).toLocaleString('ru-RU')} RPM</strong>`).join('<span class="fan-separator"> / </span>') : (linked ? 'Связанные тахометры недоступны' : 'Запустите общий автотест для автоматической привязки RPM');
  const mode = ch.mode === 0 ? 'DC' : ch.mode === 1 ? 'PWM' : 'N/A';
  return `<article class="fan-card" data-channel="${esc(ch.id)}">
  <div class="card-header"><div><div class="fan-title">${esc(ch.name)}</div><div class="fan-sub">${esc(ch.chip)} · ${esc(mode)} · ${disabled ? 'мониторинг' : sub}</div></div><span class="chip ${ch.active ? '' : 'neutral'}">${badge}</span></div>
+ <div class="linked-fans">${fanNames}</div>
  <div class="speed-row"><div class="speed-big">${pct}<small>%</small></div><span class="small-label">${ch.target_pwm !== null ? `Уставка ${Math.round(ch.target_pwm/255*100)}% · Контроллер ${actualPct ?? '—'}%` : (ch.value === null ? 'NO VALUE' : ch.value + '/255')}</span></div>
  <input type="range" class="track fan-slider" min="${min}" max="100" value="${Math.max(min, pct)}" step="1" aria-label="Мощность ${esc(ch.name)}" ${disabled?'disabled':''}>
- <div class="card-actions"><button class="mini-btn accent apply-speed" ${disabled?'disabled':''}>Применить</button><button class="mini-btn calibrate" ${disabled?'disabled':''}>Автотест ↗</button>${ch.dc_available ? `<button class="mini-btn switch-mode" ${disabled?'disabled':''}>${ch.mode===0?'PWM':'DC'} режим</button>` : ''}${ch.active || ch.recoverable ? '<button class="mini-btn firmware">Вернуть BIOS</button>':''}</div>
- <div class="cal-note">${ch.control_drift ? 'Обнаружено внешнее изменение PWM; Fanform пытается восстановить уставку. ' : ''}${cal ? `Калибровка: ${min}% безопасный минимум · ${linked} RPM-сенсор(а).` : (disabled ? 'Режим read-only: разъём недоступен для управления.' : 'Автотест сопоставит канал с тахометром и проверит нижнюю границу.')}</div>
+ <div class="card-actions"><button class="mini-btn accent apply-speed" ${disabled?'disabled':''}>Применить</button>${ch.dc_available ? `<button class="mini-btn switch-mode" ${disabled?'disabled':''}>${ch.mode===0?'PWM':'DC'} режим</button>` : ''}${ch.active || ch.recoverable ? '<button class="mini-btn firmware">Вернуть BIOS</button>':''}</div>
+ <div class="cal-note">${ch.control_drift ? 'Обнаружено внешнее изменение PWM; Fanform пытается восстановить уставку. ' : ''}${cal ? `Калибровка: ${min}% безопасный минимум · ${linked} RPM-сенсор(а).` : (disabled ? 'Режим read-only: разъём недоступен для управления.' : 'Общий автотест сопоставит канал с RPM и найдёт нижний предел.')}</div>
  </article>`;
 }
 function render(data) {
@@ -48,32 +52,59 @@ function render(data) {
    ...data.temperatures.map(t=>({name:t.name,chip:t.chip,value:t.celsius+' °C'})),
    ...data.fans.map(f=>({name:f.name,chip:f.chip,value:f.rpm === null?'—':f.rpm+' RPM'}))];
  $('#sensors').innerHTML = sensors.length ? sensors.map(s=>`<div class="sensor-row"><div><div class="sensor-name">${esc(s.name)}</div><span class="sensor-chip">${esc(s.chip)}</span></div><div class="sensor-val">${esc(s.value)}</div></div>`).join('') : `<div class="empty">Датчики не найдены.</div>`;
+ renderCalibration(data.job, data);
  const notice = $('#notice');
- if (data.conflict) {notice.hidden=false; notice.textContent = 'Найден другой активный fan daemon. Управление заблокировано.';}
- else if (data.alarm) {notice.hidden=false; notice.textContent = `Защита: ${data.alarm}`;}
- else if (data.job.state === 'running' || data.job.state === 'error' || data.job.state === 'complete') {notice.hidden=false; notice.textContent=`Автотест · ${data.job.progress}% · ${data.job.message}`;}
+ // The sensor temperatures remain available in the metrics; no temperature popups.
+ if (data.conflict) {notice.hidden=false; notice.textContent='Другой контроллер вентиляторов уже работает. Fanform не будет конкурировать с ним.';}
+ else if (data.alarm && !/температур|перегрев/i.test(data.alarm)) {notice.hidden=false; notice.textContent=`Защита: ${data.alarm}`;}
  else notice.hidden=true;
+}
+function renderCalibration(job, data) {
+ const running = job?.state === 'running';
+ const button = $('#calibrate-all');
+ const eligible = (data.channels || []).filter(ch => ch.writable && !ch.active && !ch.recoverable).length;
+ button.disabled = running || !!data.conflict || eligible === 0;
+ button.textContent = running ? 'Автотест выполняется…' : 'Автотест всех вентиляторов ↗';
+ const panel = $('#calibration-panel');
+ panel.hidden = !job || job.state === 'idle';
+ if (panel.hidden) return;
+ const percent = Math.max(0, Math.min(100, Number(job.progress) || 0));
+ $('#calibration-progress').value = percent;
+ $('#calibration-percent').textContent = `${percent}%`;
+ $('#calibration-title').textContent = running ? `Канал ${job.current || 1} из ${job.total || 1}` :
+    (job.state === 'complete' ? 'Автотест завершён' : 'Автотест прерван');
+ const message = String(job.message || '');
+ $('#calibration-message').textContent = /температур|перегрев/i.test(message) ? 'Защита охлаждения остановила автотест' : message;
+ $('#calibration-results').innerHTML = (job.results || []).map(item => {
+   const label = item.status === 'mapped' ? `${(item.fans || []).length} RPM · минимум ${Math.ceil(item.safe_pwm / 255 * 100)}%` :
+     (/температур|перегрев/i.test(item.message || '') ? 'Остановлено защитой охлаждения' : (item.message || 'Привязка не выполнена'));
+   return `<div class="calibration-result"><span>${esc(item.name)}</span><span class="${item.status === 'mapped' ? 'calibration-ok' : 'calibration-miss'}">${esc(label)}</span></div>`;
+ }).join('');
 }
 async function refresh() {
  if (!authenticated) return;
  try {
   const result = await api('/api/state');
   if (Date.now() >= editUntil) render(result);
-  else { state = result; if (result.job.state==='running') {$('#notice').hidden=false; $('#notice').textContent=`Автотест · ${result.job.progress}% · ${result.job.message}`;} }
+  else { state = result; renderCalibration(result.job, result); }
  } catch (e) { $('#online').classList.remove('ok'); $('#online').lastChild.textContent = ' Offline'; }
 }
 const action = async (path,data,success,onSuccess) => {
  try { const result=await api(path,data); if(onSuccess)onSuccess(result); if(success)toast(success); editUntil=0; await refresh(); }
- catch(e) {toast(e.message);}
+ catch(e) {toast(visibleError(e.message));}
 };
 $('#login-form').addEventListener('submit', async e=>{ e.preventDefault(); try { await api('/api/login',{password:$('#password').value}); $('#password').value=''; $('#login-error').textContent=''; showDashboard(); await refresh(); }catch(e){ $('#login-error').textContent=e.message; } });
 $('#logout').addEventListener('click', async()=>{try {await api('/api/logout',{});}finally{showLogin();}});
+$('#calibrate-all').addEventListener('click', () => {
+ if(confirm('Fanform последовательно проверит доступные вентиляторы, измерит RPM, автоматически привяжет тахометры к ползункам и найдёт рабочий минимум. Во время теста обеспечьте минимальную нагрузку на хост. Начать?')) {
+   action('/api/calibrate/all', {}, 'Автотест запущен');
+ }
+});
 $('#channels').addEventListener('input',e=>{if(e.target.matches('.fan-slider')) {editUntil=Date.now()+5000; const card=e.target.closest('.fan-card'); drafts.set(card.dataset.channel, Number(e.target.value)); card.querySelector('.speed-big').innerHTML = e.target.value+'<small>%</small>';}});
 $('#channels').addEventListener('click', async e=>{
  const card = e.target.closest('.fan-card'); if(!card) return;
  const cid = card.dataset.channel, ch=state.channels.find(c=>c.id===cid);
  if(e.target.closest('.apply-speed')) return action('/api/speed',{channel:cid,percent:Number(card.querySelector('.fan-slider').value)},'Уставка подтверждена',()=>drafts.delete(cid));
- if(e.target.closest('.calibrate')) {if(confirm('Автотест временно изменит скорость вентилятора. Запускайте при низкой нагрузке, убедившись, что охлаждение исправно. Продолжить?')) return action('/api/calibrate',{channel:cid},'Калибровка запущена');}
  if(e.target.closest('.switch-mode')) {const mode = ch.mode===0?1:0; if(confirm(`Изменить режим питания на ${mode?'PWM':'DC'}? Это допустимо только для совместимого разъёма и вентилятора. Скорость будет сначала увеличена до 100%.`)) return action('/api/mode',{channel:cid,mode},'Режим изменён. Повторите автотест.');}
  if(e.target.closest('.firmware')) return action('/api/firmware',{channel:cid},'Исходное управление восстановлено');
 });
