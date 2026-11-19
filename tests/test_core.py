@@ -208,3 +208,32 @@ class ManualSetpointTests(unittest.TestCase):
         self.control._monitor_once()
         self.assertEqual(hwmon.number(self.hw/'pwm1'), 255)
         self.assertIn('температура', self.control.alarm.lower())
+
+
+class CoolingDiagnosticsTests(unittest.TestCase):
+    setUp = FakeHwmon.setUp
+
+    def test_inventory_reports_exact_blocking_sensor(self):
+        (self.hw/'temp1_input').write_text('68000')
+        status = self.control.inventory()['cooling_check']
+        self.assertFalse(status['can_start'])
+        self.assertIn('nct6775', status['reason'])
+        self.assertIn('68.0 °C', status['reason'])
+        self.assertIn('65 °C', status['reason'])
+        self.assertEqual(status['hottest']['celsius'], 68.0)
+        with self.assertRaisesRegex(core.SafetyError, 'nct6775.*68.0.*65'):
+            self.control.start_auto_test()
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 2)
+
+    def test_inventory_ok_when_within_guard(self):
+        status = self.control.inventory()['cooling_check']
+        self.assertTrue(status['can_start'])
+        self.assertIsNone(status['reason'])
+
+    def test_no_temperature_sensors_gives_actionable_diagnostic(self):
+        (self.hw/'temp1_input').unlink()
+        status = self.control.inventory()['cooling_check']
+        self.assertFalse(status['can_start'])
+        self.assertIn('Не найдены', status['reason'])
+        with self.assertRaisesRegex(core.SafetyError, 'Не найдены'):
+            self.control.start_auto_test()

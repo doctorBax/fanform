@@ -4,7 +4,8 @@ const $ = (s) => document.querySelector(s);
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let state = null, authenticated = false, editUntil = 0;
 const drafts = new Map(), groupDrafts = new Map();
-const visibleError = (message) => /температур|перегрев/i.test(message) ? 'Защита охлаждения отклонила операцию' : message;
+// Show the actual hwmon sensor/threshold instead of an unhelpful generic error.
+const visibleError = (message) => String(message || 'Неизвестная ошибка');
 const toast = (message) => { const t = $('#toast'); t.textContent = message; t.classList.add('visible'); setTimeout(() => t.classList.remove('visible'), 4000); };
 async function api(path, body) {
   const options = body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json','X-Fanform-Request':'1'}, body:JSON.stringify(body)};
@@ -56,28 +57,37 @@ function render(data) {
  const notice = $('#notice');
  // The sensor temperatures remain available in the metrics; no temperature popups.
  if (data.conflict) {notice.hidden=false; notice.textContent='Другой контроллер вентиляторов уже работает. Fanform не будет конкурировать с ним.';}
- else if (data.alarm && !/температур|перегрев/i.test(data.alarm)) {notice.hidden=false; notice.textContent=`Защита: ${data.alarm}`;}
+ else if (data.alarm && !/температур|перегрев|порог|тест остановлен/i.test(data.alarm)) {notice.hidden=false; notice.textContent=`Защита: ${data.alarm}`;}
  else notice.hidden=true;
 }
 function renderCalibration(job, data) {
  const running = job?.state === 'running';
  const button = $('#calibrate-all');
  const eligible = (data.channels || []).filter(ch => ch.writable && !ch.active && !ch.recoverable).length;
- button.disabled = running || !!data.conflict || eligible === 0;
+ const blocked = data.cooling_check && !data.cooling_check.can_start;
+ button.disabled = running || !!data.conflict || eligible === 0 || blocked;
  button.textContent = running ? 'Автотест выполняется…' : 'Автотест всех вентиляторов ↗';
  const panel = $('#calibration-panel');
- panel.hidden = !job || job.state === 'idle';
+ panel.hidden = (!job || job.state === 'idle') && !blocked;
  if (panel.hidden) return;
+ if ((!job || job.state === 'idle') && blocked) {
+   $('#calibration-progress').value = 0;
+   $('#calibration-percent').textContent = '0%';
+   $('#calibration-title').textContent = 'Автотест пока недоступен';
+   $('#calibration-message').textContent = data.cooling_check.reason;
+   $('#calibration-results').replaceChildren();
+   return;
+ }
  const percent = Math.max(0, Math.min(100, Number(job.progress) || 0));
  $('#calibration-progress').value = percent;
  $('#calibration-percent').textContent = `${percent}%`;
  $('#calibration-title').textContent = running ? `Канал ${job.current || 1} из ${job.total || 1}` :
     (job.state === 'complete' ? 'Автотест завершён' : 'Автотест прерван');
  const message = String(job.message || '');
- $('#calibration-message').textContent = /температур|перегрев/i.test(message) ? 'Защита охлаждения остановила автотест' : message;
+ $('#calibration-message').textContent = message;
  $('#calibration-results').innerHTML = (job.results || []).map(item => {
    const label = item.status === 'mapped' ? `${(item.fans || []).length} RPM · минимум ${Math.ceil(item.safe_pwm / 255 * 100)}%` :
-     (/температур|перегрев/i.test(item.message || '') ? 'Остановлено защитой охлаждения' : (item.message || 'Привязка не выполнена'));
+     (item.message || 'Привязка не выполнена');
    return `<div class="calibration-result"><span>${esc(item.name)}</span><span class="${item.status === 'mapped' ? 'calibration-ok' : 'calibration-miss'}">${esc(label)}</span></div>`;
  }).join('');
 }

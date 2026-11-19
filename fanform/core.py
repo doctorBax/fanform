@@ -41,6 +41,11 @@ class StallDetected(SafetyError):
     pass
 
 
+class TemperatureSafetyError(SafetyError):
+    """A critical cooling precondition failed; requires emergency recovery."""
+    pass
+
+
 def recovery_path():
     return STATE.with_name('recovery.json')
 
@@ -82,6 +87,7 @@ class Controller:
             c['target_pwm'] = self.targets.get(c['id'])
             c['control_drift'] = self.drift_counts.get(c['id'], 0)
         return {'channels': channels, 'fans': fans, 'temperatures': temps,
+                'cooling_check': self.cooling_check(temps),
                 'groups': self.cfg['groups'], 'alarm': self.alarm, 'job': {**self.job, 'results': [dict(result) for result in self.job.get('results', [])]}, 'conflict': self.conflict}
 
     def channel(self, cid):
@@ -89,15 +95,37 @@ class Controller:
             if c['id'] == cid: return c
         raise SafetyError('Канал не найден. Обновите список устройств.')
 
+    @staticmethod
+    def cooling_check(temperatures):
+        """Describe why a new manual operation/calibration may be refused.
+
+        This is read-only. Frontend can display a precise inline explanation
+        instead of hiding the hardware sensor that blocked the operation.
+        """
+        if not temperatures:
+            return {'can_start': False, 'reason': 'Не найдены температурные датчики hwmon. Автотест не запущен.',
+                    'hottest': None, 'start_limit_c': MAX_START_TEMP, 'abort_limit_c': HIGH_TEMP}
+        hottest = max(temperatures, key=lambda t: t['celsius'])
+        blocked = hottest['celsius'] >= MAX_START_TEMP
+        return {'can_start': not blocked,
+                'reason': (f'Автотест не запущен: {hottest["name"]} ({hottest["chip"]}) '
+                           f'показывает {hottest["celsius"]} °C при пороге начала {MAX_START_TEMP:g} °C. '
+                           'Проверьте этот датчик в списке ниже и показания на самом Proxmox.' if blocked else None),
+                'hottest': {'id': hottest['id'], 'name': hottest['name'],
+                            'chip': hottest['chip'], 'celsius': hottest['celsius']},
+                'start_limit_c': MAX_START_TEMP, 'abort_limit_c': HIGH_TEMP}
+
     def _temperature_check(self, start=False):
         temperatures = hwmon.discover()[2]
         if not temperatures:
-            raise SafetyError('Нет температурных датчиков: управление заблокировано')
+            raise TemperatureSafetyError('Не найдены температурные датчики hwmon. Защитная проверка не пройдена.')
         hottest = max(temperatures, key=lambda t: t['celsius'])
         maximum = hottest['celsius']
         threshold = MAX_START_TEMP if start else HIGH_TEMP
         if maximum >= threshold:
-            raise SafetyError(f'Перегрев/высокая температура: {hottest["name"]} ({maximum}°C, порог {threshold}°C)')
+            raise TemperatureSafetyError(f'Температура: {hottest["name"]} ({hottest["chip"]}) '
+                              f'показывает {maximum} °C, порог {threshold:g} °C. '
+                              'Проверьте показания этого датчика в Proxmox.')
         return maximum
 
     def _remember(self, ch):
@@ -382,9 +410,8 @@ class Controller:
                           message=f'{len(linked)} датчик(а) привязано')
             progress(100, 'Привязка сохранена')
         except (OSError, SafetyError, ValueError) as error:
-            emergency = (isinstance(error, (OSError, StallDetected))
-                         or self.calibration_abort.is_set()
-                         or any(word in str(error).lower() for word in ('температур', 'перегрев')))
+            emergency = (isinstance(error, (OSError, StallDetected, TemperatureSafetyError))
+                         or self.calibration_abort.is_set())
             result.update(status='error', message=str(error), emergency=emergency)
         finally:
             if original:
