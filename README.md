@@ -94,3 +94,17 @@ Unit tests use fake temporary hwmon paths and never touch real fan headers.
 ## Stack
 
 Linux hwmon, Python 3 standard library, vanilla HTML/CSS/JS, systemd. No npm, Docker, telemetry, or cloud.
+
+## Multi-step assisted mapping
+
+The single autotest button now checks tachometer response across several PWM
+levels (255, 215, 175, 150) and checks recovery at 255 before mapping a
+sensor. A speed sensor must respond consistently across multiple measurements;
+small fluctuations on unrelated sensors do not create a mapping. After
+pairing, the existing minimum-speed calibration runs as before, and the
+RPM response curve is stored in calibration data.
+
+This is a Fan Control-style approach, not a copy of proprietary code. No RPM
+response can also mean that BIOS/EC overrides the control, an input-only
+sensor, or a fan that cannot be matched reliably. An unconfirmed pairing is
+reported as such rather than guessed.

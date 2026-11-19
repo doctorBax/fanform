@@ -82,7 +82,7 @@ class BatchCalibrationTests(unittest.TestCase):
         original_write=hwmon.write
         def heat(path, duty):
             original_write(path,duty)
-            if path.name=='pwm1' and duty == 210:
+            if path.name=='pwm1' and duty == 215:
                 (self.hw/'temp1_input').write_text('80000')
         with mock.patch.object(hwmon,'write',side_effect=heat),mock.patch.object(core.time,'sleep',lambda _:None):
             self.control.start_auto_test()

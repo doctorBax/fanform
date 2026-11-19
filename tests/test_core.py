@@ -149,7 +149,7 @@ class AdditionalSafetyTests(unittest.TestCase):
         saved=hwmon.write
         def heat(path, duty):
             saved(path,duty)
-            if path.name=='pwm1' and duty == 210:
+            if path.name=='pwm1' and duty == 215:
                 (self.hw/'temp1_input').write_text('80000')
         with mock.patch.object(hwmon,'write',side_effect=heat),mock.patch.object(core.time,'sleep',lambda *_:None):
             self.control._calibrate(cid)
@@ -253,3 +253,36 @@ class CoolingDiagnosticsTests(unittest.TestCase):
         self.assertIn('Не найдены', status['reason'])
         with self.assertRaisesRegex(core.SafetyError, 'Не найдены'):
             self.control.start_auto_test()
+
+class AssistedMappingTests(unittest.TestCase):
+    setUp = FakeHwmon.setUp
+
+    def test_fan_with_full_speed_plateau_is_mapped(self):
+        cid = hwmon.discover()[0][0]['id']
+        original = hwmon.write
+        def simulate(path, duty):
+            original(path, duty)
+            if path.name == 'pwm1':
+                rpm = 1450 if duty >= 205 else round(1450*duty/205)
+                (self.hw/'fan1_input').write_text(str(rpm))
+        with mock.patch.object(hwmon, 'write', side_effect=simulate), mock.patch.object(core.time, 'sleep', lambda _:None):
+            self.control._calibrate(cid)
+        self.assertEqual(self.control.job['state'], 'complete')
+        calibration = self.control.cfg['calibrations'][cid]
+        self.assertEqual(len(calibration['fans']), 1)
+        self.assertEqual(len(calibration['response_curve']), 1)
+        entry = next(iter(calibration['response_curve'].values()))
+        self.assertEqual(entry['rpm_at_100'], entry['rpm_at_84'])
+        self.assertTrue(entry['matched'])
+
+    def test_unrelated_fan_noise_does_not_create_false_link(self):
+        cid = hwmon.discover()[0][0]['id']
+        original = hwmon.write
+        def simulate(path,duty):
+            original(path,duty)
+            if path.name=='pwm1':
+                (self.hw/'fan1_input').write_text('1450' if duty != 175 else '1410')
+        with mock.patch.object(hwmon, 'write', side_effect=simulate), mock.patch.object(core.time, 'sleep', lambda _:None):
+            self.control._calibrate(cid)
+        self.assertEqual(self.control.job['state'], 'error')
+        self.assertFalse(self.control.cfg['calibrations'])

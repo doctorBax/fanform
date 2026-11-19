@@ -372,21 +372,45 @@ class Controller:
             self._write_pwm(ch, 255)
             progress(8, 'Измеряю RPM на полной мощности')
             baseline = self._measure(3)
-            strong = {fid: rpm for fid, rpm in baseline.items() if rpm >= 500}
+            # Assisted pairing: measure several response points, not just 255->210.
+            # Some fans have a wide 100% plateau or need time to settle.
+            strong = {fid: rpm for fid, rpm in baseline.items() if rpm >= 300}
             if not strong:
-                raise SafetyError('Нет тахометров с RPM ≥500')
-            self._ensure_running()
-            self._write_pwm(ch, 210)
-            progress(22, 'Сопоставляю PWM с тахометрами')
-            low = self._measure(3, baseline=strong, monitored=list(strong))
-            linked = [fid for fid, rpm in strong.items()
-                      if fid in low and rpm - low[fid] >= max(120, rpm * .12)]
+                raise SafetyError('Не найден работающий тахометр (RPM ≥300); сопоставление невозможно')
+            observations = [(255, baseline)]
+            for duty, stage in ((215, 17), (175, 25), (150, 31)):
+                self._ensure_running()
+                self._write_pwm(ch, duty)
+                progress(stage, f'Поиск отклика RPM · мощность {round(duty / 255 * 100)}%')
+                sample = self._measure(3, baseline=strong, monitored=list(strong))
+                observations.append((duty, sample))
             self._ensure_running()
             self._write_pwm(ch, 255)
-            recovered = self._measure(3)
-            linked = [fid for fid in linked if fid in recovered and recovered[fid] >= baseline[fid] * .85]
+            progress(33, 'Проверяю восстановление оборотов')
+            recovered = self._measure(3, baseline=strong, monitored=list(strong))
+            linked = []
+            response = {}
+            for fid, high in strong.items():
+                series = [point.get(fid) for _, point in observations]
+                up = recovered.get(fid)
+                if any(value is None for value in series) or up is None:
+                    continue
+                delta = high - series[-1]
+                individual_drops = [series[k] - series[k + 1] for k in range(3)]
+                significant_steps = sum(x >= max(20, high * .025) for x in individual_drops)
+                monotonic = all(series[k + 1] <= series[k] + max(45, high * .06) for k in range(3))
+                recovered_enough = up >= high * .88 and up >= series[-1] + max(45, high * .08)
+                matched = (delta >= max(65, high * .10) and significant_steps >= 2
+                           and monotonic and recovered_enough)
+                response[fid] = {'rpm_at_100': high, 'rpm_at_84': series[1],
+                                 'rpm_at_69': series[2], 'rpm_at_59': series[3],
+                                 'rpm_recovered': up, 'matched': matched}
+                if matched:
+                    linked.append(fid)
             if not linked:
-                raise SafetyError('Нет надёжного соответствия PWM → RPM; канал не привязан')
+                raise SafetyError('PWM менялся, но ни один RPM не показал устойчивого '
+                                  'отклика на 84→69→59% с возвратом к 100%. '
+                                  'Проверьте управление BIOS/EC и соответствие датчиков.')
             progress(35, f'Найдено связанных тахометров: {len(linked)}')
             lowest = 210
             sequence = [190, 170, 150, 130, 115, 100, 85, 70, 60]
@@ -405,11 +429,13 @@ class Controller:
             safe = min(255, max(lowest + 20, 85))
             calibration = {'fans': linked, 'safe_pwm': safe,
                            'baseline_rpm': {fid: strong[fid] for fid in linked},
+                           'response_curve': {fid: response[fid] for fid in linked},
                            'tested_mode': hwmon.number(Path(ch['mode_path'])) if ch['mode_path'] else None,
                            'measured_at': int(time.time())}
             self.cfg['calibrations'][cid] = calibration
             save_json(CONFIG, self.cfg)
             result.update(status='mapped', fans=linked, safe_pwm=safe,
+                          response_curve={fid: response[fid] for fid in linked},
                           message=f'{len(linked)} датчик(а) привязано')
             progress(100, 'Привязка сохранена')
         except (OSError, SafetyError, ValueError) as error:
