@@ -138,3 +138,14 @@ The explicit Return to BIOS action also works even if the temperature reading
 is high. Failed hardware restoration retains the snapshot for retry.
 Critical temperature/RPM checks remain active for new manual setpoints and
 calibration. Conflicting fan-controller daemons still prevent manual control.
+
+
+## Adaptive RPM settling (calibration)
+
+The RPM detection now waits for two consecutive low-variance/low-trend
+windows of eight tachometer readings rather than relying on fixed three-second
+samples. Each step has a minimum observation period and a bounded maximum:
+15–60 seconds for pairing and 12–45 seconds for the calibrated floor.
+Slowly accelerating or decelerating fans extend the wait automatically.
+Unstable or noisy tachometers are reported with per-phase diagnostics, not
+silently mapped. The existing temperature, stall, and recovery checks remain.

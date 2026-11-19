@@ -425,3 +425,46 @@ class RecoveryWithoutManualUnblockTests(unittest.TestCase):
         self.assertNotIn(cid, self.control.recovery)
         self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 2)
         fake_thread.return_value.start.assert_called_once()
+
+
+class AdaptiveSettlingTests(unittest.TestCase):
+    setUp = FakeHwmon.setUp
+
+    def test_slow_ramp_keeps_sampling_past_minimum(self):
+        step = {'n': 0}
+        original = hwmon.discover
+        def slow():
+            channels, fans, temps = original()
+            n = step['n'] // 2
+            step['n'] += 1
+            fans[0]['rpm'] = 700 + min(n, 24) * 14
+            return channels, fans, temps
+        with mock.patch.object(hwmon, 'discover', side_effect=slow), \
+             mock.patch.object(core.time, 'sleep', lambda *_: None):
+            observed, meta = self.control._measure_stable(min_seconds=12, max_seconds=48)
+        self.assertGreater(meta['elapsed_seconds'], 24)
+        self.assertFalse(meta['timed_out'])
+        self.assertIn('fan1', ' '.join(meta['stable_fans']))
+        self.assertGreaterEqual(observed[next(k for k in observed if 'fan1' in k)], 1000)
+
+    def test_stable_rpm_finishes_before_timeout(self):
+        with mock.patch.object(core.time, 'sleep', lambda *_: None):
+            seen, meta = self.control._measure_stable(min_seconds=12, max_seconds=45)
+        self.assertEqual(meta['elapsed_seconds'], 12)
+        self.assertFalse(meta['timed_out'])
+        self.assertGreater(seen[next(k for k in seen if 'fan1' in k)], 0)
+
+    def test_unstable_rpm_is_reported_not_falsely_paired(self):
+        counter = {'n': 0}
+        original = hwmon.discover
+        def jitter():
+            channels, fans, temps = original()
+            counter['n'] += 1
+            fans[0]['rpm'] = 650 if (counter['n']//2) % 2 else 1250
+            return channels, fans, temps
+        with mock.patch.object(hwmon, 'discover', side_effect=jitter), \
+             mock.patch.object(core.time, 'sleep', lambda *_: None):
+            _, meta = self.control._measure_stable(min_seconds=12, max_seconds=26)
+        self.assertEqual(meta['elapsed_seconds'], 26)
+        self.assertTrue(meta['timed_out'])
+        self.assertNotIn(next(k for k in meta['unstable_fans'] if 'fan1' in k), meta['stable_fans'])

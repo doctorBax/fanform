@@ -106,10 +106,13 @@ function renderCalibration(job, data) {
  $('#calibration-results').innerHTML = (job.results || []).map(item => {
    const label = item.status === 'mapped' ? `${(item.fans || []).length} RPM · минимум ${Math.ceil(item.safe_pwm / 255 * 100)}%` :
      (item.message || 'Привязка не выполнена');
+   const stageTimes = (item.stabilization || []).map(t =>
+     `<div>${esc(t.phase)}: ${Number(t.elapsed_seconds)} с · ${t.timed_out ? 'время истекло' : 'стабильно'} · ${(t.unstable_fans || []).length} нестабильных</div>`
+   ).join('');
    const details = Object.entries(item.response_curve || {}).map(([id, r]) =>
      `<div>${esc(id)} · ${r.rpm_at_100 ?? '—'} → ${r.rpm_at_84 ?? '—'} → ${r.rpm_at_69 ?? '—'} → ${r.rpm_at_59 ?? '—'} → ${r.rpm_recovered ?? '—'} RPM · ${esc(r.reason || (r.matched ? 'подтверждено' : 'не подтверждено'))}</div>`
    ).join('');
-   return `<div class="calibration-result"><div><strong>${esc(item.name)}</strong><p class="${item.status === 'mapped' ? 'calibration-ok' : 'calibration-miss'}">${esc(label)}</p>${details ? `<details class="calibration-details"><summary>Измерения RPM (100% → 84% → 69% → 59% → 100%)</summary>${details}</details>` : ''}</div></div>`;
+   return `<div class="calibration-result"><div><strong>${esc(item.name)}</strong><p class="${item.status === 'mapped' ? 'calibration-ok' : 'calibration-miss'}">${esc(label)}</p>${details ? `<details class="calibration-details"><summary>Измерения RPM (100% → 84% → 69% → 59% → 100%)</summary>${details}</details>` : ''}${stageTimes ? `<details class="calibration-details"><summary>Время стабилизации RPM</summary>${stageTimes}</details>` : ''}</div></div>`;
  }).join('');
 }
 async function refresh() {

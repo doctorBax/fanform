@@ -49,7 +49,7 @@ class BatchCalibrationTests(unittest.TestCase):
             entered.set()
             gate.wait(3)
             return {'fake': 1500}
-        with mock.patch.object(self.control, '_measure', side_effect=measure):
+        with mock.patch.object(self.control, '_measure_stable', side_effect=lambda **kwargs: (measure(), {'stable_fans':[], 'unstable_fans':[], 'timed_out':False, 'elapsed_seconds':10, 'max_seconds':10})):
             self.control.start_auto_test()
             self.assertTrue(entered.wait(1), 'calibration never started measuring')
             polled = threading.Event()

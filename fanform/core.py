@@ -397,8 +397,77 @@ class Controller:
             time.sleep(.5)
         return {fid: round(median(v)) for fid, v in values.items()}
 
+    def _measure_stable(self, *, min_seconds=14, max_seconds=50,
+                        baseline=None, monitored=None, on_progress=None):
+        """Observe RPM until its trend and dispersion have settled.
+
+        Unlike a fixed pause, a fan that is still accelerating/decelerating
+        holds the probe open, up to a bounded deadline. Stable status is
+        retained per tachometer for RPM/PWM association.
+        """
+        min_seconds = max(8, int(min_seconds))
+        max_seconds = max(min_seconds, int(max_seconds))
+        history = {}
+        stable_streak = {}
+        last = {}
+        done = False
+        elapsed = 0
+        stable = set()
+        for tick in range(max_seconds):
+            self._ensure_running()
+            self._temperature_check()
+            current = {f['id']: f['rpm'] for f in hwmon.discover()[1]}
+            for fid in monitored or []:
+                rpm = current.get(fid)
+                if rpm is None or rpm < max(350, baseline[fid] * .25):
+                    raise StallDetected(f'Потеря оборотов: {fid}')
+            for fid, rpm in current.items():
+                if rpm is None or rpm < 0:
+                    stable_streak[fid] = 0
+                    continue
+                history.setdefault(fid, []).append(rpm)
+                history[fid] = history[fid][-14:]
+                readings = history[fid]
+                if len(readings) < 8:
+                    stable_streak[fid] = 0
+                    continue
+                tail = readings[-8:]
+                mean = median(tail)
+                # A small spread alone can conceal a slow continued trend.
+                flat = ((max(tail)-min(tail)) <= max(40, mean * .05)
+                        and abs(median(tail[:4])-median(tail[4:]))
+                            <= max(18, mean * .015))
+                stable_streak[fid] = stable_streak.get(fid, 0) + 1 if flat else 0
+            last = current
+            elapsed = tick + 1
+            stable = {fid for fid, streak in stable_streak.items()
+                      if streak >= 2 and current.get(fid) is not None}
+            active = [fid for fid, rpm in current.items() if rpm is not None and rpm >= 0]
+            # An accelerating fan must not be masked by two already-stable
+            # unrelated tachometers in a three-fan system.
+            drifting = set()
+            for fid in active:
+                samples = history.get(fid, [])
+                if len(samples) >= 8 and fid not in stable:
+                    if abs(median(samples[-4:])-median(samples[-8:-4])) > max(22, median(samples[-8:])*.018):
+                        drifting.add(fid)
+            required = max(1, (len(active) * 2 + 2)//3)
+            done = len(stable) >= required and not drifting
+            if elapsed >= min_seconds and done:
+                break
+            if elapsed < max_seconds:
+                if on_progress and elapsed % 3 == 0:
+                    on_progress(elapsed, max_seconds)
+                time.sleep(1)
+        result = {fid: round(median(samples[-6:]))
+                  for fid, samples in history.items() if samples}
+        return result, {'elapsed_seconds': elapsed, 'max_seconds': max_seconds,
+                        'stable_fans': sorted(stable),
+                        'unstable_fans': sorted(set(last) - stable),
+                        'timed_out': not done}
+
     @staticmethod
-    def _analyse_pairing(observations, recovered, confirm_low, confirm_high):
+    def _analyse_pairing(observations, recovered, confirm_low, confirm_high, quality=None):
         """Repeatable RPM/PWM A-B-A-B response test with per-sensor diagnostics.
 
         Match only controls whose speed changes in both cycles, even if the
@@ -417,6 +486,13 @@ class Controller:
             again_high = confirm_high.get(fid)
             if any(v is None for v in samples) or None in (up, again_low, again_high):
                 response[fid] = {'matched':False, 'reason':'Датчик не отвечает на всех этапах'}
+                continue
+            if quality is not None and any(fid not in stage['stable_fans'] for stage in quality):
+                response[fid] = {'matched': False,
+                                 'reason': 'RPM не успели стабилизироваться на каждом этапе',
+                                 'rpm_at_100': initial, 'rpm_at_84': samples[1],
+                                 'rpm_at_69': samples[2], 'rpm_at_59': samples[3],
+                                 'rpm_recovered': up}
                 continue
             low = min(samples[1:])
             first_drop = initial - low
@@ -460,30 +536,47 @@ class Controller:
             original = hwmon.snapshot(ch)
             self._write_pwm(ch, 255)
             progress(8, 'Измеряю RPM на полной мощности')
-            baseline = self._measure(3, settle=3)
-            strong = {fid:rpm for fid,rpm in baseline.items() if rpm is not None and rpm >= 300}
+            # Do not guess a physical fan's spin-up/spin-down delay.
+            timings = []
+            quality = []
+            def collect(phase, stage, duty, min_wait, timeout, monitored=None):
+                progress(stage, f'{phase}: ожидание стабилизации RPM')
+                def tick(seconds, limit):
+                    progress(stage, f'{phase}: {seconds} с (макс. {limit} с)')
+                rpm, meta = self._measure_stable(
+                    min_seconds=min_wait, max_seconds=timeout,
+                    baseline=strong if monitored else None,
+                    monitored=monitored, on_progress=tick)
+                meta['phase'] = phase
+                meta['pwm'] = duty
+                timings.append(meta)
+                return rpm, meta
+            baseline, base_quality = collect('100% · старт', 8, 255, 18, 60)
+            strong = {fid:rpm for fid,rpm in baseline.items()
+                      if rpm is not None and rpm >= 300}
             if not strong:
                 raise SafetyError('Нет доступных RPM-датчиков с оборотами от 300')
             observations = [(255, baseline)]
+            quality.append(base_quality)
             for duty, stage in ((215, 14), (175, 22), (150, 29)):
                 self._ensure_running()
                 self._write_pwm(ch, duty)
-                progress(stage, f'Жду стабилизации на {round(duty/255*100)}%')
-                # Unpaired tachometers may be unrelated or intermittently
-                # idle. Don't use them as stall signals before association.
-                readings = self._measure(3, settle=3)
+                readings, metadata = collect(f'{round(duty/255*100)}% · снижение',
+                                             stage, duty, 15, 50)
                 observations.append((duty, readings))
+                quality.append(metadata)
             self._ensure_running()
             self._write_pwm(ch, 255)
-            progress(31, 'Проверяю возврат к 100%')
-            recovered = self._measure(3, settle=3)
+            recovered, recover_quality = collect('100% · разгон', 31, 255, 20, 60)
             self._write_pwm(ch, 150)
-            progress(32, 'Подтверждаю отклик повторным импульсом')
-            confirm_low = self._measure(3, settle=3)
+            confirm_low, low_quality = collect('59% · подтверждение', 32, 150, 15, 50)
             self._write_pwm(ch, 255)
-            confirm_high = self._measure(3, settle=3)
-            linked, response = self._analyse_pairing(observations, recovered,
-                                                      confirm_low, confirm_high)
+            confirm_high, high_quality = collect('100% · повторный разгон',
+                                                 33, 255, 20, 60)
+            quality.extend((recover_quality, low_quality, high_quality))
+            linked, response = self._analyse_pairing(
+                observations, recovered, confirm_low, confirm_high, quality=quality)
+            result['stabilization'] = timings
             result['response_curve'] = response
             if not linked:
                 raise SafetyError('Не удалось подтвердить реакцию RPM на две смены PWM. '
@@ -498,7 +591,16 @@ class Controller:
                          f'Проверяю нижний предел · {round(duty / 255 * 100)}%')
                 self._write_pwm(ch, duty)
                 try:
-                    self._measure(3, baseline=strong, monitored=linked, settle=1)
+                    _, floor_meta = self._measure_stable(
+                        min_seconds=12, max_seconds=45, baseline=strong,
+                        monitored=linked,
+                        on_progress=lambda elapsed, limit: progress(
+                            35 + round(56 * index / len(sequence)),
+                            f'Проверяю {round(duty / 255 * 100)}%: {elapsed}/{limit} с'))
+                    result.setdefault('floor_timings', []).append(
+                        {'pwm': duty, **floor_meta})
+                    if any(fid not in floor_meta['stable_fans'] for fid in linked):
+                        raise SafetyError('Обороты не стабилизировались при поиске нижнего предела')
                 except StallDetected:
                     self._write_pwm(ch, 255)
                     break
