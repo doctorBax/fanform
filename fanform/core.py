@@ -358,6 +358,52 @@ class Controller:
             time.sleep(.5)
         return {fid: round(median(v)) for fid, v in values.items()}
 
+    @staticmethod
+    def _analyse_pairing(observations, recovered, confirm_low, confirm_high):
+        """Repeatable RPM/PWM A-B-A-B response test with per-sensor diagnostics.
+
+        Match only controls whose speed changes in both cycles, even if the
+        tachometer has a flat response region near 100% PWM.
+        """
+        baseline = observations[0][1]
+        response = {}
+        linked = []
+        levels = [int(duty) for duty, _ in observations]
+        for fid, initial in baseline.items():
+            if initial is None or initial < 300:
+                continue
+            samples = [reading.get(fid) for _, reading in observations]
+            up = recovered.get(fid)
+            again_low = confirm_low.get(fid)
+            again_high = confirm_high.get(fid)
+            if any(v is None for v in samples) or None in (up, again_low, again_high):
+                response[fid] = {'matched':False, 'reason':'Датчик не отвечает на всех этапах'}
+                continue
+            low = min(samples[1:])
+            first_drop = initial - low
+            repeat_drop = again_high - again_low
+            recovery = up - low
+            threshold = max(55, initial * .08)
+            recovered_enough = up >= initial * .82 and again_high >= initial * .82
+            reacted_twice = first_drop >= threshold and repeat_drop >= max(45, initial * .07)
+            recovered_twice = recovery >= threshold and recovered_enough
+            monotonic = all(samples[i+1] <= samples[i] + max(60, initial*.08)
+                            for i in range(len(samples)-1))
+            matched = reacted_twice and recovered_twice and monotonic
+            response[fid] = {
+                'duty': levels, 'rpm':samples, 'rpm_recovered':up,
+                'rpm_confirmed_low':again_low,'rpm_confirmed_high':again_high,
+                'matched':matched,
+                'reason':('Двукратная реакция подтверждена' if matched else
+                          f'Реакция не подтверждена (падение {round(first_drop)} RPM, '
+                          f'повторное {round(repeat_drop)} RPM)'),
+                'rpm_at_100':initial, 'rpm_at_84':samples[1],
+                'rpm_at_69':samples[2], 'rpm_at_59':samples[3],
+            }
+            if matched:
+                linked.append(fid)
+        return linked, response
+
     def _calibrate_channel(self, cid, progress):
         """Map RPM changes to exactly one PWM channel, then measure safe floor.
 
@@ -375,69 +421,35 @@ class Controller:
             original = hwmon.snapshot(ch)
             self._write_pwm(ch, 255)
             progress(8, 'Измеряю RPM на полной мощности')
-            baseline = self._measure(3, settle=2)
-            # Assisted pairing: measure several response points, not just 255->210.
-            # Some fans have a wide 100% plateau or need time to settle.
-            strong = {fid: rpm for fid, rpm in baseline.items() if rpm >= 300}
+            baseline = self._measure(3, settle=3)
+            strong = {fid:rpm for fid,rpm in baseline.items() if rpm is not None and rpm >= 300}
             if not strong:
-                raise SafetyError('Не найден работающий тахометр (RPM ≥300); сопоставление невозможно')
+                raise SafetyError('Нет доступных RPM-датчиков с оборотами от 300')
             observations = [(255, baseline)]
-            for duty, stage in ((215, 17), (175, 25), (150, 31)):
+            for duty, stage in ((215, 14), (175, 22), (150, 29)):
                 self._ensure_running()
                 self._write_pwm(ch, duty)
-                progress(stage, f'Поиск отклика RPM · мощность {round(duty / 255 * 100)}%')
-                sample = self._measure(3, baseline=strong, monitored=list(strong), settle=2)
-                observations.append((duty, sample))
+                progress(stage, f'Жду стабилизации на {round(duty/255*100)}%')
+                # Unpaired tachometers may be unrelated or intermittently
+                # idle. Don't use them as stall signals before association.
+                readings = self._measure(3, settle=3)
+                observations.append((duty, readings))
             self._ensure_running()
             self._write_pwm(ch, 255)
-            progress(33, 'Проверяю восстановление оборотов')
-            recovered = self._measure(3, baseline=strong, monitored=list(strong), settle=2)
-            linked = []
-            response = {}
-            for fid, high in strong.items():
-                series = [point.get(fid) for _, point in observations]
-                up = recovered.get(fid)
-                if any(value is None for value in series) or up is None:
-                    continue
-                delta = high - series[-1]
-                individual_drops = [series[k] - series[k + 1] for k in range(3)]
-                significant_steps = sum(x >= max(20, high * .025) for x in individual_drops)
-                monotonic = all(series[k + 1] <= series[k] + max(45, high * .06) for k in range(3))
-                recovered_enough = up >= high * .88 and up >= series[-1] + max(45, high * .08)
-                matched = (delta >= max(65, high * .10) and significant_steps >= 1
-                           and monotonic and recovered_enough)
-                response[fid] = {'rpm_at_100': high, 'rpm_at_84': series[1],
-                                 'rpm_at_69': series[2], 'rpm_at_59': series[3],
-                                 'rpm_recovered': up, 'matched': matched}
-                if matched:
-                    linked.append(fid)
-            # A second reversible pulse rejects transient tachometer noise.
-            if linked:
-                self._ensure_running()
-                progress(33, 'Подтверждаю RPM повторным воздействием')
-                self._write_pwm(ch, 150)
-                confirmation_low = self._measure(3, baseline=strong, monitored=linked, settle=2)
-                self._write_pwm(ch, 255)
-                confirmation_high = self._measure(3, baseline=strong, monitored=linked, settle=2)
-                confirmed = []
-                for fid in linked:
-                    low_rpm = confirmation_low.get(fid)
-                    high_rpm = confirmation_high.get(fid)
-                    baseline_rpm = strong[fid]
-                    verified = (low_rpm is not None and high_rpm is not None
-                                and baseline_rpm - low_rpm >= max(65, baseline_rpm * .10)
-                                and high_rpm - low_rpm >= max(50, baseline_rpm * .08)
-                                and high_rpm >= baseline_rpm * .86)
-                    response[fid].update(rpm_confirmed_low=low_rpm,
-                                         rpm_confirmed_high=high_rpm, matched=verified)
-                    if verified:
-                        confirmed.append(fid)
-                linked = confirmed
+            progress(31, 'Проверяю возврат к 100%')
+            recovered = self._measure(3, settle=3)
+            self._write_pwm(ch, 150)
+            progress(32, 'Подтверждаю отклик повторным импульсом')
+            confirm_low = self._measure(3, settle=3)
+            self._write_pwm(ch, 255)
+            confirm_high = self._measure(3, settle=3)
+            linked, response = self._analyse_pairing(observations, recovered,
+                                                      confirm_low, confirm_high)
             result['response_curve'] = response
             if not linked:
-                raise SafetyError('PWM менялся, но ни один RPM не показал устойчивого '
-                                  'отклика на 84→69→59% с возвратом к 100%. '
-                                  'Проверьте DC/PWM, BIOS/EC и тахометры. Откройте измерения ниже.')
+                raise SafetyError('Не удалось подтвердить реакцию RPM на две смены PWM. '
+                                  'Посмотрите измерения: если RPM не меняются, управление '
+                                  'может оставаться у BIOS/EC либо выбран неверный режим DC/PWM.')
             progress(35, f'Найдено связанных тахометров: {len(linked)}')
             lowest = 210
             sequence = [190, 170, 150, 130, 115, 100, 85, 70, 60]
@@ -456,6 +468,7 @@ class Controller:
             safe = min(255, max(lowest + 20, 85))
             calibration = {'fans': linked, 'safe_pwm': safe,
                            'baseline_rpm': {fid: strong[fid] for fid in linked},
+                           'pairing_method': 'repeated-response',
                            'response_curve': {fid: response[fid] for fid in linked},
                            'tested_mode': hwmon.number(Path(ch['mode_path'])) if ch['mode_path'] else None,
                            'measured_at': int(time.time())}

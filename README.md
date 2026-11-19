@@ -49,6 +49,15 @@ Channels currently in manual control or in emergency recovery are deliberately
 skipped; restore them to firmware first if they also need calibration. Read-only
 sensors remain visible but are not operated.
 
+Fanform uses an independent, reversible repeated-response pairing test (100%
+→ 84% → 69% → 59% → 100% → 59% → 100%). Each step waits for tachometer
+settling and captures median RPM. Unrelated tachometers are not treated as a
+stall in the unknown-mapping stage. RPM must react and recover twice before
+it is automatically associated with that PWM channel. Failed tests keep
+per-sensor readings in the UI for hardware diagnosis. As with Fan Control,
+automatic RPM detection is limited to information actually exposed by the
+controller/driver; hardware may ignore Linux PWM values despite write success.
+
 The button starts a background job and exposes live per-channel progress through
 `GET /api/state`. The web UI shows the overall progress bar, currently tested
 channel, and results as they arrive, without blocking polling. The old

@@ -89,7 +89,7 @@ function renderCalibration(job, data) {
    const label = item.status === 'mapped' ? `${(item.fans || []).length} RPM · минимум ${Math.ceil(item.safe_pwm / 255 * 100)}%` :
      (item.message || 'Привязка не выполнена');
    const details = Object.entries(item.response_curve || {}).map(([id, r]) =>
-     `<div>${esc(id)} · ${r.rpm_at_100 ?? '—'} → ${r.rpm_at_84 ?? '—'} → ${r.rpm_at_69 ?? '—'} → ${r.rpm_at_59 ?? '—'} → ${r.rpm_recovered ?? '—'} RPM · ${r.matched ? 'подтверждено' : 'не подтверждено'}</div>`
+     `<div>${esc(id)} · ${r.rpm_at_100 ?? '—'} → ${r.rpm_at_84 ?? '—'} → ${r.rpm_at_69 ?? '—'} → ${r.rpm_at_59 ?? '—'} → ${r.rpm_recovered ?? '—'} RPM · ${esc(r.reason || (r.matched ? 'подтверждено' : 'не подтверждено'))}</div>`
    ).join('');
    return `<div class="calibration-result"><div><strong>${esc(item.name)}</strong><p class="${item.status === 'mapped' ? 'calibration-ok' : 'calibration-miss'}">${esc(label)}</p>${details ? `<details class="calibration-details"><summary>Измерения RPM (100% → 84% → 69% → 59% → 100%)</summary>${details}</details>` : ''}</div></div>`;
  }).join('');

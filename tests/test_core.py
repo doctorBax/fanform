@@ -313,3 +313,48 @@ class RepeatConfirmationTests(unittest.TestCase):
             self.control._calibrate(cid)
         self.assertEqual(self.control.job['state'],'error')
         self.assertEqual(hwmon.number(self.hw/'pwm1_enable'),2)
+
+
+class AssistedPairingTests(unittest.TestCase):
+    setUp = FakeHwmon.setUp
+
+    def test_response_analysis_rejects_unrelated_fan(self):
+        data = [(255, {'a': 1200, 'b': 1300}), (215, {'a': 1050, 'b': 1300}),
+                (175, {'a': 800, 'b': 1305}), (150, {'a': 650, 'b': 1295})]
+        linked, details = self.control._analyse_pairing(
+            data, {'a': 1210, 'b': 1310},
+            {'a': 650, 'b': 1300}, {'a': 1220, 'b': 1310})
+        self.assertEqual(linked, ['a'])
+        self.assertTrue(details['a']['matched'])
+        self.assertFalse(details['b']['matched'])
+
+    def test_response_analysis_requires_two_cycles(self):
+        data = [(255, {'a': 1100}), (215, {'a': 950}),
+                (175, {'a': 700}), (150, {'a': 600})]
+        linked, details = self.control._analyse_pairing(
+            data, {'a': 1090}, {'a': 1090}, {'a': 1090})
+        self.assertEqual(linked, [])
+        self.assertFalse(details['a']['matched'])
+
+    def test_probe_does_not_abort_due_to_unrelated_slow_sensor(self):
+        cid = hwmon.discover()[0][0]['id']
+        saved = hwmon.write
+        def hardware(path, duty):
+            saved(path, duty)
+            if path.name == 'pwm1':
+                (self.hw/'fan1_input').write_text(str(round(1500*duty/255) if duty >= 115 else 200))
+        (self.hw/'fan2_input').write_text('300')
+        with mock.patch.object(hwmon, 'write', side_effect=hardware), \
+             mock.patch.object(core.time, 'sleep', lambda *_: None):
+            self.control._calibrate(cid)
+        self.assertEqual(self.control.job['state'], 'complete')
+        self.assertIn('fan1', self.control.cfg['calibrations'][cid]['fans'][0])
+
+    def test_auto_pair_keeps_evidence_if_nothing_reacts(self):
+        cid = hwmon.discover()[0][0]['id']
+        with mock.patch.object(core.time, 'sleep', lambda *_: None):
+            self.control._calibrate(cid)
+        item = self.control.job['results'][0]
+        self.assertEqual(item['status'], 'error')
+        self.assertTrue(item['response_curve'])
+        self.assertFalse(any(r.get('matched') for r in item['response_curve'].values()))
