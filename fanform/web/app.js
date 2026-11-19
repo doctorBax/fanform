@@ -17,25 +17,30 @@ async function api(path, body) {
 function showLogin() { authenticated = false; $('#login').hidden = false; $('#dashboard').hidden = true; $('#logout').hidden = true; $('#online').classList.remove('ok'); $('#online').lastChild.textContent = ' Locked'; }
 function showDashboard() { authenticated = true; $('#login').hidden = true; $('#dashboard').hidden = false; $('#logout').hidden = false; $('#online').classList.add('ok'); $('#online').lastChild.textContent = ' Live'; }
 function card(ch) {
- const cal = ch.calibration, linked = cal?.fans?.length || 0;
- const threshold = cal && linked ? cal.safe_pwm : 180;
+ const cal = ch.calibration, linked = ch.linked_fans || [];
+ const threshold = cal && cal.fans?.length ? cal.safe_pwm : 180;
  const disabled = !ch.writable;
  const requested = typeof ch.target_pwm === 'number' ? ch.target_pwm : ch.value;
  const actualPct = typeof ch.value === 'number' ? Math.round(ch.value/255*100) : null;
  const pct = drafts.has(ch.id) ? drafts.get(ch.id) : (typeof requested === 'number' ? Math.round(requested/255*100) : 100);
- const min = Math.ceil(threshold / 255 * 100);
- const badge = disabled ? 'READ ONLY' : (ch.active ? 'MANUAL' : 'FIRMWARE');
- const liveFans = ch.linked_fans || [];
- const sub = linked ? `${linked} RPM-датчик(а) · нижняя граница ${min}%` : 'Тахометр пока не привязан';
- const fanNames = liveFans.length ? liveFans.map(f => `${esc(f.name)} · <strong>${f.rpm === null ? '—' : Number(f.rpm).toLocaleString('ru-RU')} RPM</strong>`).join('<span class="fan-separator"> / </span>') : (linked ? 'Связанные тахометры недоступны' : 'Запустите общий автотест для автоматической привязки RPM');
- const mode = ch.mode === 0 ? 'DC' : ch.mode === 1 ? 'PWM' : 'N/A';
+ const min = Math.ceil(threshold/255*100), value = Math.max(min,Math.min(100,pct));
+ const mode = ch.mode === 0 ? 'DC' : ch.mode === 1 ? 'PWM' : 'FAN';
+ const mainFan = linked.find(f => Number.isFinite(f.rpm)) || linked[0];
+ const rpm = mainFan && Number.isFinite(mainFan.rpm) ? Number(mainFan.rpm).toLocaleString('ru-RU') : '—';
+ const active = !!ch.active;
+ const stateText = disabled ? 'Только мониторинг' : active ? 'Ручное управление' : 'Управление BIOS';
+ const stateBadge = disabled ? 'Нет доступа' : active ? 'Активно' : 'Авто';
+ const drift = typeof ch.target_pwm === 'number' && actualPct !== null && Math.abs(ch.target_pwm-ch.value)>4;
+ const warning = drift ? `<div class="fan-warning" role="status">Скорость меняется извне · сейчас ${actualPct}%</div>` : '';
+ const otherFans = linked.length > 1 ? `<div class="fan-extra">${linked.slice(1).map(f=>`${esc(f.name)}: ${Number.isFinite(f.rpm) ? Number(f.rpm).toLocaleString('ru-RU') : '—'} RPM`).join(' · ')}</div>` : '';
+ const hasSettings = ch.dc_available || active || ch.recoverable || !!cal || !!ch.control_drift || !!linked.length;
  return `<article class="fan-card" data-channel="${esc(ch.id)}">
- <div class="card-header"><div><div class="fan-title">${esc(ch.name)}</div><div class="fan-sub">${esc(ch.chip)} · ${esc(mode)} · ${disabled ? 'мониторинг' : sub}</div></div><span class="chip ${ch.active ? '' : 'neutral'}">${badge}</span></div>
- <div class="linked-fans">${fanNames}</div>
- <div class="speed-row"><div class="speed-big">${pct}<small>%</small></div><span class="small-label">${ch.target_pwm !== null ? `Уставка ${Math.round(ch.target_pwm/255*100)}% · Контроллер ${actualPct ?? '—'}%` : (ch.value === null ? 'NO VALUE' : ch.value + '/255')}</span></div>
- <input type="range" class="track fan-slider" min="${min}" max="100" value="${Math.max(min, pct)}" step="1" aria-label="Мощность ${esc(ch.name)}" ${disabled?'disabled':''}>
- <div class="card-actions"><button class="mini-btn accent apply-speed" ${disabled?'disabled':''}>Применить</button>${ch.dc_available ? `<button class="mini-btn switch-mode" ${disabled?'disabled':''}>${ch.mode===0?'PWM':'DC'} режим</button>` : ''}${ch.active || ch.recoverable ? '<button class="mini-btn firmware">Вернуть BIOS</button>':''}</div>
- <div class="cal-note">${ch.control_drift ? 'Обнаружено внешнее изменение PWM; Fanform пытается восстановить уставку. ' : ''}${cal ? `Калибровка: ${min}% безопасный минимум · ${linked} RPM-сенсор(а).` : (disabled ? 'Режим read-only: разъём недоступен для управления.' : 'Общий автотест сопоставит канал с RPM и найдёт нижний предел.')}</div>
+  <div class="card-header"><div class="fan-heading"><h3 class="fan-title">${esc(ch.name)}</h3><p class="fan-sub">${esc(ch.chip)}</p></div><span class="mode-badge">${mode}</span></div>
+  <div class="speed-row"><div class="speed-big" aria-label="Мощность ${esc(ch.name)}">${pct}<small>%</small></div><div class="rpm-reading"><strong>${rpm}<span> RPM</span></strong><span class="rpm-caption">${mainFan ? esc(mainFan.name) : 'Тахометр не привязан'}</span></div></div>
+  <input type="range" class="track fan-slider" style="--fill:${value}%" min="${min}" max="100" value="${value}" step="1" aria-label="Мощность ${esc(ch.name)}" ${disabled?'disabled':''}>
+  <div class="fan-control-row"><span class="control-state"><span class="state-dot ${active ? 'on' : ''}"></span>${stateText}</span><span class="state-badge ${active ? 'is-active' : ''}">${stateBadge}</span></div>
+  ${warning}
+  <div class="card-actions"><button type="button" class="mini-btn accent apply-speed" ${disabled?'disabled':''}>Применить <span aria-hidden="true">↗</span></button>${hasSettings ? `<details class="fan-options"><summary>Настройки <span aria-hidden="true">⌄</span></summary><div class="advanced-actions">${ch.dc_available ? `<button type="button" class="mini-btn switch-mode" ${disabled?'disabled':''}>Переключить на ${ch.mode === 0 ? 'PWM' : 'DC'}</button>` : ''}${ch.active || ch.recoverable ? '<button type="button" class="mini-btn firmware">Вернуть BIOS</button>' : ''}${cal?.fans?.length ? `<span class="advanced-caption">Привязано ${cal.fans.length} RPM · минимум ${min}%</span>` : ''}${otherFans}</div></details>` : ''}</div>
  </article>`;
 }
 function render(data) {
@@ -47,8 +52,21 @@ function render(data) {
  const rpms = data.fans.filter(f => f.rpm !== null);
  $('#metrics').innerHTML = `<div class="metric"><div class="metric-label">Контролируемые каналы</div><div class="metric-value">${data.channels.filter(c=>c.writable).length}<span class="metric-unit">/ ${data.channels.length}</span></div></div><div class="metric"><div class="metric-label">RPM датчики</div><div class="metric-value">${rpms.length}<span class="metric-unit">шт.</span></div></div><div class="metric"><div class="metric-label">Средние обороты</div><div class="metric-value">${rpms.length? Math.round(rpms.reduce((a,f)=>a+f.rpm,0)/rpms.length).toLocaleString('ru-RU') : '—'}<span class="metric-unit">RPM</span></div></div>`;
  $('#fan-count').textContent = `${data.channels.length} TOTAL`;
+ const openOptions = new Set([...$('#channels').querySelectorAll('.fan-card:has(.fan-options[open])')].map(el => el.dataset.channel));
  $('#channels').innerHTML = data.channels.length ? data.channels.map(card).join('') : `<div class="empty">PWM-каналы не обнаружены. Проверьте, поддерживает ли ваш контроллер Linux hwmon и загружен ли драйвер датчиков. Панель работает в режиме мониторинга.</div>`;
- $('#groups').innerHTML = data.groups.length ? data.groups.map(g => { const min = Math.max(...g.channels.map(cid => {const ch=data.channels.find(x=>x.id===cid);return ch?.calibration?.fans?.length ? Math.ceil(ch.calibration.safe_pwm/255*100) : 71;})); const targets = g.channels.map(cid=>data.channels.find(x=>x.id===cid)?.target_pwm); const applied = targets.length && targets.every(v=>typeof v==='number' && v===targets[0]) ? Math.round(targets[0]/255*100) : 100; const requested = groupDrafts.has(g.id) ? groupDrafts.get(g.id) : applied; return `<article class="group-card" data-group="${esc(g.id)}"><div class="group-top"><div><h3>${esc(g.name)}</h3><div class="group-sub">${g.channels.length} канал(а)</div></div><button class="mini-btn delete-group">Удалить</button></div><div class="group-controls"><input type="range" class="track group-slider" min="${min}" max="100" value="${Math.max(min,requested)}" aria-label="Мощность группы ${esc(g.name)}"><span class="group-pct">${requested}%</span><button class="mini-btn accent apply-group">Применить</button></div></article>`; }).join('') : `<div class="empty">Групп пока нет. Объедините, например, вентиляторы корзины HDD и регулируйте их вместе.</div>`;
+ $('#channels').querySelectorAll('.fan-card').forEach(el => { if (openOptions.has(el.dataset.channel)) { const settings = el.querySelector('.fan-options'); if (settings) settings.open = true; } });
+ $('#groups').innerHTML = data.groups.length ? data.groups.map(g => {
+  const min = Math.max(...g.channels.map(cid => {const ch=data.channels.find(x=>x.id===cid);return ch?.calibration?.fans?.length ? Math.ceil(ch.calibration.safe_pwm/255*100) : 71;}));
+  const targets = g.channels.map(cid => data.channels.find(x=>x.id===cid)?.target_pwm);
+  const applied = targets.length && targets.every(v=>typeof v==='number' && v===targets[0]) ? Math.round(targets[0]/255*100) : 100;
+  const pct = groupDrafts.has(g.id) ? groupDrafts.get(g.id) : applied;
+  const value = Math.max(min,Math.min(100,pct));
+  return `<article class="group-card" data-group="${esc(g.id)}">
+   <div class="group-top"><div><h3>${esc(g.name)}</h3><p class="group-sub">${g.channels.length} канал(а)</p></div><button type="button" class="quiet-btn delete-group" aria-label="Удалить группу ${esc(g.name)}">Удалить</button></div>
+   <div class="group-power"><span class="group-pct">${pct}<small>%</small></span><span class="group-hint">Общая мощность</span></div>
+   <input type="range" class="track group-slider" style="--fill:${value}%" min="${min}" max="100" value="${value}" aria-label="Мощность группы ${esc(g.name)}">
+   <div class="group-actions"><span class="control-state"><span class="state-dot"></span>Группа</span><button type="button" class="mini-btn accent apply-group">Применить ↗</button></div></article>`;
+ }).join('') : `<div class="empty">Групп пока нет. Объедините несколько каналов для общего управления.</div>`;
  const sensors = [
    ...data.temperatures.map(t=>({name:t.name,chip:t.chip,value:t.celsius+' °C'})),
    ...data.fans.map(f=>({name:f.name,chip:f.chip,value:f.rpm === null?'—':f.rpm+' RPM'}))];
@@ -113,15 +131,15 @@ $('#calibrate-all').addEventListener('click', () => {
    action('/api/calibrate/all', {}, 'Автотест запущен');
  }
 });
-$('#channels').addEventListener('input',e=>{if(e.target.matches('.fan-slider')) {editUntil=Date.now()+5000; const card=e.target.closest('.fan-card'); drafts.set(card.dataset.channel, Number(e.target.value)); card.querySelector('.speed-big').innerHTML = e.target.value+'<small>%</small>';}});
+$('#channels').addEventListener('input',e=>{if(e.target.matches('.fan-slider')) {editUntil=Date.now()+5000; const card=e.target.closest('.fan-card'); drafts.set(card.dataset.channel, Number(e.target.value)); card.querySelector('.speed-big').innerHTML = e.target.value+'<small>%</small>'; e.target.style.setProperty('--fill',e.target.value+'%');}});
 $('#channels').addEventListener('click', async e=>{
  const card = e.target.closest('.fan-card'); if(!card) return;
  const cid = card.dataset.channel, ch=state.channels.find(c=>c.id===cid);
- if(e.target.closest('.apply-speed')) return action('/api/speed',{channel:cid,percent:Number(card.querySelector('.fan-slider').value)},'Уставка подтверждена',()=>drafts.delete(cid));
+ if(e.target.closest('.apply-speed')) return action('/api/speed',{channel:cid,percent:Number(card.querySelector('.fan-slider').value)},'Скорость применена',()=>drafts.delete(cid));
  if(e.target.closest('.switch-mode')) {const mode = ch.mode===0?1:0; if(confirm(`Изменить режим питания на ${mode?'PWM':'DC'}? Это допустимо только для совместимого разъёма и вентилятора. Скорость будет сначала увеличена до 100%.`)) return action('/api/mode',{channel:cid,mode},'Режим изменён. Повторите автотест.');}
  if(e.target.closest('.firmware')) return action('/api/firmware',{channel:cid},'Исходное управление восстановлено');
 });
-$('#groups').addEventListener('input',e=>{if(e.target.matches('.group-slider')){editUntil=Date.now()+5000; const card=e.target.closest('.group-card'); groupDrafts.set(card.dataset.group,Number(e.target.value)); card.querySelector('.group-pct').textContent=e.target.value+'%';}});
+$('#groups').addEventListener('input',e=>{if(e.target.matches('.group-slider')){editUntil=Date.now()+5000; const card=e.target.closest('.group-card'); groupDrafts.set(card.dataset.group,Number(e.target.value)); card.querySelector('.group-pct').innerHTML=e.target.value+'<small>%</small>'; e.target.style.setProperty('--fill',e.target.value+'%');}});
 $('#groups').addEventListener('click',e=>{
  const card=e.target.closest('.group-card');if(!card)return;
  if(e.target.closest('.apply-group'))return action('/api/group/speed',{id:card.dataset.group,percent:Number(card.querySelector('input').value)},'Группа обновлена',()=>groupDrafts.delete(card.dataset.group));
