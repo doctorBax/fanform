@@ -62,6 +62,8 @@ sensor(s) and their **live RPM readings appear on the corresponding slider card*
 Ambiguous RPM-to-PWM mappings are discarded, rather than presented as fact.
 No manual mode is left active following a completed test.
 
+The obsolete 65°C preflight cutoff has been removed: the start check now uses the same 75°C emergency threshold as runtime monitoring. There is no option to disable emergency recovery for critical temperature or stalled RPM.
+
 The UI does not show routine temperature alert banners or popup messages. Actual
 temperatures remain visible as sensor readings. **The backend emergency thermal
 and stall checks remain enabled**: hardware safety overrides convenience, and

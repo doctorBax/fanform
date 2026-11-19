@@ -12,7 +12,10 @@ from . import hwmon
 CONFIG = Path(os.environ.get('FANFORM_CONFIG', '/etc/fanform/config.json'))
 STATE = Path(os.environ.get('FANFORM_STATE', '/var/lib/fanform/state.json'))
 HIGH_TEMP = 75.0
-MAX_START_TEMP = 65.0
+# Use one critical boundary for both preflight and runtime checks. The old
+# 65 C preflight threshold blocked otherwise healthy, warm Proxmox hosts even
+# though the emergency guard would not trip until 75 C.
+MAX_START_TEMP = HIGH_TEMP
 
 
 def save_json(path, data):

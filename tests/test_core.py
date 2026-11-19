@@ -38,7 +38,7 @@ class FakeHwmon(unittest.TestCase):
 
     def test_temperature_guard_prevents_write(self):
         cid=hwmon.discover()[0][0]['id']
-        (self.hw/'temp1_input').write_text('70000')
+        (self.hw/'temp1_input').write_text('80000')
         with self.assertRaises(core.SafetyError):self.control.set_speed(cid,90)
         self.assertEqual(hwmon.number(self.hw/'pwm1_enable'),2)
 
@@ -214,14 +214,30 @@ class CoolingDiagnosticsTests(unittest.TestCase):
     setUp = FakeHwmon.setUp
 
     def test_inventory_reports_exact_blocking_sensor(self):
-        (self.hw/'temp1_input').write_text('68000')
+        (self.hw/'temp1_input').write_text('78000')
         status = self.control.inventory()['cooling_check']
         self.assertFalse(status['can_start'])
         self.assertIn('nct6775', status['reason'])
-        self.assertIn('68.0 °C', status['reason'])
-        self.assertIn('65 °C', status['reason'])
-        self.assertEqual(status['hottest']['celsius'], 68.0)
-        with self.assertRaisesRegex(core.SafetyError, 'nct6775.*68.0.*65'):
+        self.assertIn('78.0 °C', status['reason'])
+        self.assertIn('75 °C', status['reason'])
+        self.assertEqual(status['hottest']['celsius'], 78.0)
+        with self.assertRaisesRegex(core.SafetyError, 'nct6775.*78.0.*75'):
+            self.control.start_auto_test()
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 2)
+
+    def test_warm_host_below_critical_limit_can_change_setpoint(self):
+        cid = hwmon.discover()[0][0]['id']
+        (self.hw/'temp1_input').write_text('70000')
+        self.assertTrue(self.control.inventory()['cooling_check']['can_start'])
+        response = self.control.set_speed(cid, 90)
+        self.assertTrue(response['verified'])
+        self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 1)
+        self.assertEqual(hwmon.number(self.hw/'pwm1'), 230)
+
+    def test_exact_critical_boundary_blocks_preflight(self):
+        (self.hw/'temp1_input').write_text('75000')
+        self.assertFalse(self.control.inventory()['cooling_check']['can_start'])
+        with self.assertRaises(core.TemperatureSafetyError):
             self.control.start_auto_test()
         self.assertEqual(hwmon.number(self.hw/'pwm1_enable'), 2)
 
