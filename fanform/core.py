@@ -583,7 +583,12 @@ class Controller:
                                   'Посмотрите измерения: если RPM не меняются, управление '
                                   'может оставаться у BIOS/EC либо выбран неверный режим DC/PWM.')
             progress(35, f'Найдено связанных тахометров: {len(linked)}')
+            # Pairing and minimum-speed calibration are independent results.
+            # A drifting tachometer at a low duty must not discard an
+            # already-confirmed PWM->RPM relationship.
             lowest = 210
+            floor_verified = True
+            floor_note = None
             sequence = [190, 170, 150, 130, 115, 100, 85, 70, 60]
             for index, duty in enumerate(sequence):
                 self._ensure_running()
@@ -600,14 +605,25 @@ class Controller:
                     result.setdefault('floor_timings', []).append(
                         {'pwm': duty, **floor_meta})
                     if any(fid not in floor_meta['stable_fans'] for fid in linked):
-                        raise SafetyError('Обороты не стабилизировались при поиске нижнего предела')
+                        # Only the floor probe is inconclusive. Preserve the
+                        # confirmed RPM relationship but use an 84% setpoint
+                        # from the pairing probe as a conservative limit.
+                        floor_verified = False
+                        floor_note = ('Нижний предел не определён: RPM не стабилизировались. '
+                                      'Привязка сохранена, доступна регулировка от 85%.')
+                        self._write_pwm(ch, 255)
+                        break
                 except StallDetected:
+                    # A stall is an observed lower bound; the last successful
+                    # stage plus a margin remains the validated limit.
                     self._write_pwm(ch, 255)
                     break
                 lowest = duty
             self._ensure_running()
-            safe = min(255, max(lowest + 20, 85))
+            safe = (min(255, max(lowest + 20, 85)) if floor_verified else 215)
             calibration = {'fans': linked, 'safe_pwm': safe,
+                           'floor_verified': floor_verified,
+                           'floor_note': floor_note,
                            'baseline_rpm': {fid: strong[fid] for fid in linked},
                            'pairing_method': 'repeated-response',
                            'response_curve': {fid: response[fid] for fid in linked},
@@ -616,9 +632,12 @@ class Controller:
             self.cfg['calibrations'][cid] = calibration
             save_json(CONFIG, self.cfg)
             result.update(status='mapped', fans=linked, safe_pwm=safe,
+                          floor_verified=floor_verified, floor_note=floor_note,
                           response_curve={fid: response[fid] for fid in linked},
-                          message=f'{len(linked)} датчик(а) привязано')
-            progress(100, 'Привязка сохранена')
+                          message=(f'{len(linked)} датчик(а) привязано' +
+                                   (f'; {floor_note}' if floor_note else '')))
+            progress(100, 'Привязка сохранена' if floor_verified
+                     else 'Привязка сохранена · минимум не подтверждён')
         except (OSError, SafetyError, ValueError) as error:
             emergency = (isinstance(error, (OSError, StallDetected, TemperatureSafetyError))
                          or self.calibration_abort.is_set())

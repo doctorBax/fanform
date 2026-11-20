@@ -149,3 +149,18 @@ samples. Each step has a minimum observation period and a bounded maximum:
 Slowly accelerating or decelerating fans extend the wait automatically.
 Unstable or noisy tachometers are reported with per-phase diagnostics, not
 silently mapped. The existing temperature, stall, and recovery checks remain.
+
+
+## Independent tachometer pairing and floor verification
+
+Fanform stores an RPM-to-PWM association after repeatable speed-response
+confirmation even when the subsequent minimum-speed probe cannot stabilize.
+A failed floor test is **not** evidence that the RPM association is wrong.
+
+Calibration stores `floor_verified=false` and `floor_note` in that case,
+reports a successful but partially calibrated channel, and uses a conservative
+215/255 (~85%) manual duty floor rather than enabling an unverified low speed.
+Existing fully verified calibrations retain their established limits.
+
+An actual RPM stall still stops the search for a lower duty; temperature,
+hardware-write and restore errors continue to trigger existing failsafe behavior.

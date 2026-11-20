@@ -40,7 +40,7 @@ function card(ch) {
   <input type="range" class="track fan-slider" style="--fill:${value}%" min="${min}" max="100" value="${value}" step="1" aria-label="Мощность ${esc(ch.name)}" ${disabled?'disabled':''}>
   <div class="fan-control-row"><span class="control-state"><span class="state-dot ${active ? 'on' : ''}"></span>${stateText}</span><span class="state-badge ${active ? 'is-active' : ''}">${stateBadge}</span></div>
   ${warning}
-  <div class="card-actions"><button type="button" class="mini-btn accent apply-speed" ${disabled?'disabled':''}>Применить <span aria-hidden="true">↗</span></button>${hasSettings ? `<details class="fan-options"><summary>Настройки <span aria-hidden="true">⌄</span></summary><div class="advanced-actions">${ch.dc_available ? `<button type="button" class="mini-btn switch-mode" ${disabled?'disabled':''}>Переключить на ${ch.mode === 0 ? 'PWM' : 'DC'}</button>` : ''}${ch.active || ch.recoverable ? '<button type="button" class="mini-btn firmware">Вернуть BIOS</button>' : ''}${cal?.fans?.length ? `<span class="advanced-caption">Привязано ${cal.fans.length} RPM · минимум ${min}%</span>` : ''}${otherFans}</div></details>` : ''}</div>
+  <div class="card-actions"><button type="button" class="mini-btn accent apply-speed" ${disabled?'disabled':''}>Применить <span aria-hidden="true">↗</span></button>${hasSettings ? `<details class="fan-options"><summary>Настройки <span aria-hidden="true">⌄</span></summary><div class="advanced-actions">${ch.dc_available ? `<button type="button" class="mini-btn switch-mode" ${disabled?'disabled':''}>Переключить на ${ch.mode === 0 ? 'PWM' : 'DC'}</button>` : ''}${ch.active || ch.recoverable ? '<button type="button" class="mini-btn firmware">Вернуть BIOS</button>' : ''}${cal?.fans?.length ? `<span class="advanced-caption">Привязано ${cal.fans.length} RPM · ${cal.floor_verified === false ? 'минимум не подтверждён, предел' : 'минимум'} ${min}%</span>` : ''}${otherFans}</div></details>` : ''}</div>
  </article>`;
 }
 function render(data) {
@@ -104,7 +104,10 @@ function renderCalibration(job, data) {
  const message = String(job.message || '');
  $('#calibration-message').textContent = message;
  $('#calibration-results').innerHTML = (job.results || []).map(item => {
-   const label = item.status === 'mapped' ? `${(item.fans || []).length} RPM · минимум ${Math.ceil(item.safe_pwm / 255 * 100)}%` :
+   const label = item.status === 'mapped' ?
+     (item.floor_verified === false ?
+       `${(item.fans || []).length} RPM привязано · минимум не подтверждён · предел ${Math.ceil(item.safe_pwm / 255 * 100)}%` :
+       `${(item.fans || []).length} RPM · минимум ${Math.ceil(item.safe_pwm / 255 * 100)}%`) :
      (item.message || 'Привязка не выполнена');
    const stageTimes = (item.stabilization || []).map(t =>
      `<div>${esc(t.phase)}: ${Number(t.elapsed_seconds)} с · ${t.timed_out ? 'время истекло' : 'стабильно'} · ${(t.unstable_fans || []).length} нестабильных</div>`
